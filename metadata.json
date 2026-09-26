@@ -1,0 +1,6 @@
+{
+  "name": "Moshi Urban Hostel PMS",
+  "description": "Hostel property management system and booking engine synchronized directly with Google Sheets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
