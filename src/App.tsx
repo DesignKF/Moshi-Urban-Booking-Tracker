@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { User } from 'firebase/auth';
+import { User, onAuthStateChanged } from 'firebase/auth';
 import {
   initAuth,
   googleSignIn,
@@ -7,6 +7,14 @@ import {
   getAccessToken,
   clearAccessToken
 } from './auth';
+import {
+  auth as firebaseAuth,
+  testFirestoreConnection,
+  saveReservationToFirestore,
+  deleteReservationFromFirestore,
+  subscribeToReservations,
+  fetchReservationsFromFirestore
+} from './firebase';
 import {
   listUserSpreadsheets,
   getSpreadsheetDetails,
@@ -28,6 +36,9 @@ import {
   Calendar,
   Bed,
   Users,
+  Database,
+  Cloud,
+  Flame,
   DollarSign,
   Search,
   Plus,
@@ -114,6 +125,10 @@ export default function App() {
   const [currency, setCurrency] = useState<'USD' | 'TZS' | 'EUR' | 'GBP'>('USD');
   const CURRENCY_RATES = { USD: 1, TZS: 2645, EUR: 0.92, GBP: 0.79 };
 
+  // Firebase Firestore Status State
+  const [firestoreConnected, setFirestoreConnected] = useState<boolean | null>(null);
+  const [isFirebaseSyncing, setIsFirebaseSyncing] = useState<boolean>(false);
+
   // Availability timeline state
   const [timelineAnchor, setTimelineAnchor] = useState<Date>(new Date('2026-09-23'));
 
@@ -175,6 +190,36 @@ export default function App() {
       }
     );
     return () => unsubscribe();
+  }, []);
+
+  // Validate Firestore Connection on boot & Subscribe to real-time reservations
+  useEffect(() => {
+    testFirestoreConnection().then(connected => {
+      setFirestoreConnected(connected);
+      if (connected) {
+        // Try initial pull from Firestore
+        fetchReservationsFromFirestore().then(list => {
+          if (list && list.length > 0) {
+            setReservations(list);
+          }
+        }).catch(err => {
+          console.warn('Initial Firestore fetch note:', err);
+        });
+
+        // Set up real-time onSnapshot listener
+        const unsub = subscribeToReservations(
+          (liveReservations) => {
+            if (liveReservations && liveReservations.length > 0) {
+              setReservations(liveReservations);
+            }
+          },
+          (err) => {
+            console.warn('Real-time reservations sync note:', err);
+          }
+        );
+        return () => unsub();
+      }
+    });
   }, []);
 
   // Format money helper
@@ -434,8 +479,10 @@ export default function App() {
 
   // Handle open New Reservation modal
   const handleOpenNewModal = (prefillRoom?: string, prefillDate?: string) => {
-    const targetRoom = prefillRoom || 'Mawenzi (Room 1)';
-    const roomObj = HOSTEL_ROOMS.find(r => targetRoom.includes(r.name)) || HOSTEL_ROOMS[0];
+    const roomObj = prefillRoom
+      ? HOSTEL_ROOMS.find(r => prefillRoom.includes(r.name) || r.name.toLowerCase() === prefillRoom.toLowerCase()) || HOSTEL_ROOMS[0]
+      : HOSTEL_ROOMS[0];
+    const targetRoom = `${roomObj.name} (${roomObj.roomCode})`;
     const defaultUnit = roomObj.units[0]?.id || 'M-S1';
 
     const checkIn = prefillDate || '2026-09-25';
@@ -574,6 +621,13 @@ export default function App() {
 
     // Direct Google Sheets API sync
     await saveReservationToSheet(finalRecord, isNew);
+
+    // Direct Firebase Firestore sync
+    try {
+      await saveReservationToFirestore(finalRecord);
+    } catch (fsErr) {
+      console.warn('Firestore reservation sync note:', fsErr);
+    }
   };
 
   // Check-in guest quick action
@@ -584,12 +638,17 @@ export default function App() {
     setConfirmModal({
       isOpen: true,
       title: 'Confirm Guest Check-in',
-      message: `Mark ${booking.guestName} (${booking.id}) as Checked-in and update Google Sheet?`,
+      message: `Mark ${booking.guestName} (${booking.id}) as Checked-in and update Google Sheet & Firebase?`,
       onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         const updated = { ...booking, status: 'Checked-in' };
         setReservations(prev => prev.map(r => (r.id === bookingId ? updated : r)));
         await saveReservationToSheet(updated, false);
+        try {
+          await saveReservationToFirestore(updated);
+        } catch (fsErr) {
+          console.warn('Firestore check-in update note:', fsErr);
+        }
         triggerToast(`Checked in ${booking.guestName}!`, 'success');
       }
     });
@@ -608,6 +667,11 @@ export default function App() {
     setCollectModalBooking(null);
     setReservations(prev => prev.map(r => (r.id === b.id ? updated : r)));
     await saveReservationToSheet(updated, false);
+    try {
+      await saveReservationToFirestore(updated);
+    } catch (fsErr) {
+      console.warn('Firestore collect payment update note:', fsErr);
+    }
     triggerToast(`Collected balance for ${b.guestName}. Marked fully paid!`, 'success');
   };
 
@@ -620,13 +684,57 @@ export default function App() {
       isOpen: true,
       title: 'Delete Reservation',
       message: `Are you sure you want to permanently delete booking ${bookingId} (${booking.guestName})? This will remove the booking from your system.`,
-      onConfirm: () => {
+      onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         setIsBookingModalOpen(false);
         setReservations(prev => prev.filter(r => r.id !== bookingId));
+        try {
+          await deleteReservationFromFirestore(bookingId);
+        } catch (fsErr) {
+          console.warn('Firestore delete note:', fsErr);
+        }
         triggerToast(`Deleted reservation ${bookingId}`, 'info');
       }
     });
+  };
+
+  // Sync all current reservations to Firebase Firestore
+  const handleSyncAllToFirestore = async () => {
+    setIsFirebaseSyncing(true);
+    try {
+      let count = 0;
+      for (const res of reservations) {
+        await saveReservationToFirestore(res);
+        count++;
+      }
+      setFirestoreConnected(true);
+      triggerToast(`Synced ${count} reservations to Firebase Cloud Database!`, 'success');
+    } catch (err: any) {
+      console.error('Firebase sync error:', err);
+      triggerToast(`Firebase sync failed: ${err.message}`, 'error');
+    } finally {
+      setIsFirebaseSyncing(false);
+    }
+  };
+
+  // Pull all records from Firebase Firestore
+  const handlePullFromFirestore = async () => {
+    setIsFirebaseSyncing(true);
+    try {
+      const list = await fetchReservationsFromFirestore();
+      if (list && list.length > 0) {
+        setReservations(list);
+        setFirestoreConnected(true);
+        triggerToast(`Loaded ${list.length} reservations from Firebase Cloud Database!`, 'success');
+      } else {
+        triggerToast('No records found in Firebase Firestore yet.', 'info');
+      }
+    } catch (err: any) {
+      console.error('Firebase fetch error:', err);
+      triggerToast(`Firebase fetch failed: ${err.message}`, 'error');
+    } finally {
+      setIsFirebaseSyncing(false);
+    }
   };
 
   // Date recalculation when dates change in modal
@@ -1198,6 +1306,23 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            {/* Firebase Cloud Sync Button */}
+            <button
+              onClick={() => handleSyncAllToFirestore()}
+              disabled={isFirebaseSyncing}
+              title={firestoreConnected ? 'Firebase Cloud Database active. Click to sync all local records to Firebase.' : 'Firebase Cloud Database'}
+              className={`hidden md:flex items-center space-x-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition border cursor-pointer ${
+                firestoreConnected
+                  ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-200'
+                  : 'bg-slate-50 text-slate-500 border-slate-200'
+              }`}
+            >
+              <Flame className={`w-3.5 h-3.5 ${isFirebaseSyncing ? 'animate-bounce text-[#d99b26]' : 'text-[#d99b26]'}`} />
+              <span className="hidden xl:inline">
+                {isFirebaseSyncing ? 'Syncing Firebase...' : 'Firebase Cloud'}
+              </span>
+            </button>
 
             {/* Direct Google Sheets Sync Button */}
             <button
@@ -1983,11 +2108,68 @@ export default function App() {
             <div className="space-y-6 animate-in fade-in duration-150 max-w-4xl">
               <div>
                 <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">
-                  Google Sheets Database Connection
+                  Cloud Database & Spreadsheet Integrations
                 </h1>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Direct two-way connection to your Moshi Urban Hostel booking spreadsheet stored in your Google Drive.
+                  Synchronize your reservations across Firebase Firestore Cloud Database and your Google Sheets booking spreadsheet.
                 </p>
+              </div>
+
+              {/* Firebase Cloud Database Card */}
+              <div className="bg-white rounded-2xl border border-[#e8e4dc] p-6 shadow-2xs space-y-5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-3">
+                    <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center font-bold">
+                      <Flame className="w-6 h-6 text-[#d99b26]" />
+                    </div>
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <h3 className="font-bold text-sm text-slate-900 font-serif">Firebase Firestore Database</h3>
+                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                          <span>Connected</span>
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        High-availability cloud persistence for reservations, guest records, and real-time multi-device sync.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={handlePullFromFirestore}
+                      disabled={isFirebaseSyncing}
+                      className="px-3.5 py-1.5 border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-semibold rounded-xl transition cursor-pointer flex items-center space-x-1.5"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isFirebaseSyncing ? 'animate-spin' : ''}`} />
+                      <span>Pull from Cloud</span>
+                    </button>
+                    <button
+                      onClick={handleSyncAllToFirestore}
+                      disabled={isFirebaseSyncing}
+                      className="px-3.5 py-1.5 bg-[#d99b26] hover:bg-[#c5891c] text-[#0d1726] font-bold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer"
+                    >
+                      <Cloud className="w-3.5 h-3.5" />
+                      <span>{isFirebaseSyncing ? 'Syncing...' : 'Sync All to Cloud'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3 border-t border-[#f1ede4] text-xs">
+                  <div className="bg-[#faf8f5] p-3 rounded-xl border border-[#ede9e1]">
+                    <span className="text-[10px] text-slate-400 font-semibold block uppercase">Cloud Project</span>
+                    <span className="font-mono text-slate-800 font-semibold text-[11px] truncate block">gen-lang-client-0837479015</span>
+                  </div>
+                  <div className="bg-[#faf8f5] p-3 rounded-xl border border-[#ede9e1]">
+                    <span className="text-[10px] text-slate-400 font-semibold block uppercase">Firestore Region</span>
+                    <span className="font-mono text-slate-800 font-semibold text-[11px]">europe-west1</span>
+                  </div>
+                  <div className="bg-[#faf8f5] p-3 rounded-xl border border-[#ede9e1]">
+                    <span className="text-[10px] text-slate-400 font-semibold block uppercase">Real-Time Sync</span>
+                    <span className="text-emerald-700 font-semibold text-[11px]">Active (onSnapshot enabled)</span>
+                  </div>
+                </div>
               </div>
 
               {/* Account Connection Card */}

@@ -1,0 +1,165 @@
+{
+  "entities": {
+    "Reservation": {
+      "title": "Reservation",
+      "description": "A hostel booking reservation record for Moshi Urban Hostel",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique booking identifier (e.g. MU-1)",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "maxLength": 64
+        },
+        "guestName": {
+          "type": "string",
+          "description": "Full name of the guest",
+          "maxLength": 150
+        },
+        "guestId": {
+          "type": "string",
+          "description": "Guest tracking ID (e.g. GS-0001)",
+          "maxLength": 64
+        },
+        "email": {
+          "type": "string",
+          "description": "Guest email address",
+          "maxLength": 200
+        },
+        "phone": {
+          "type": "string",
+          "description": "Guest contact phone or WhatsApp number",
+          "maxLength": 50
+        },
+        "room": {
+          "type": "string",
+          "description": "Assigned room name",
+          "maxLength": 100
+        },
+        "bedCode": {
+          "type": "string",
+          "description": "Assigned bed code (e.g. M-S1, N-B1L, B-B1L, S-S1)",
+          "maxLength": 30
+        },
+        "unitId": {
+          "type": "string",
+          "description": "Unit or bed unit ID",
+          "maxLength": 30
+        },
+        "bedsCount": {
+          "type": "number",
+          "description": "Number of beds booked"
+        },
+        "checkIn": {
+          "type": "string",
+          "description": "Check-in date (YYYY-MM-DD)",
+          "maxLength": 20
+        },
+        "checkOut": {
+          "type": "string",
+          "description": "Check-out date (YYYY-MM-DD)",
+          "maxLength": 20
+        },
+        "nights": {
+          "type": "number",
+          "description": "Duration of stay in nights"
+        },
+        "totalAmount": {
+          "type": "number",
+          "description": "Total stay price"
+        },
+        "paidAmount": {
+          "type": "number",
+          "description": "Amount deposited or paid"
+        },
+        "balanceDue": {
+          "type": "number",
+          "description": "Remaining unpaid balance"
+        },
+        "status": {
+          "type": "string",
+          "description": "Reservation status",
+          "enum": ["Confirmed", "Checked-in", "Checked-out", "Tentative", "No-show", "Cancelled", "Refunded"],
+          "maxLength": 30
+        },
+        "currency": {
+          "type": "string",
+          "description": "Booking currency",
+          "enum": ["USD", "TZS", "EUR", "GBP"],
+          "maxLength": 10
+        },
+        "platform": {
+          "type": "string",
+          "description": "Channel or platform of reservation",
+          "maxLength": 60
+        },
+        "notes": {
+          "type": "string",
+          "description": "Special requests or guest notes",
+          "maxLength": 1000
+        },
+        "loyalty": {
+          "type": "string",
+          "description": "Guest loyalty status",
+          "maxLength": 60
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp ISO or server timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Timestamp ISO or server timestamp"
+        }
+      },
+      "required": ["id", "guestName", "room", "bedCode", "checkIn", "checkOut", "status"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Staff or admin user profile",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "description": "Staff email address",
+          "maxLength": 200
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Staff display name",
+          "maxLength": 150
+        },
+        "role": {
+          "type": "string",
+          "description": "User role",
+          "enum": ["admin", "staff", "manager"],
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Created at timestamp"
+        }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/reservations/{reservationId}": {
+      "schema": {
+        "$ref": "#/entities/Reservation"
+      },
+      "description": "Collection of hostel reservation records"
+    },
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "Hostel staff and manager user profiles"
+    }
+  }
+}

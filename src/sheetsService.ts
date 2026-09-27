@@ -124,9 +124,22 @@ export async function readSheetRows(
 
 function formatSheetDate(dateStr: string): string {
   if (!dateStr) return '';
+  // Handle YYYY-MM-DD safely without timezone distortion
+  const parts = dateStr.trim().split('-');
+  if (parts.length === 3) {
+    const y = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10) - 1;
+    const d = parseInt(parts[2], 10);
+    if (!isNaN(y) && !isNaN(m) && !isNaN(d)) {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const month = months[m] || 'Jan';
+      const day = String(d).padStart(2, '0');
+      return `${day} ${month} ${y}`;
+    }
+  }
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return dateStr;
-  const day = d.getDate();
+  const day = String(d.getDate()).padStart(2, '0');
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const month = months[d.getMonth()];
   const year = d.getFullYear();
@@ -300,19 +313,18 @@ function buildRowForHeaders(
 
   // Ensure Bed Code belongs to shortRoom to satisfy Google Sheets dropdown data validation:
   // e.g. Soweto only permits "S-S1", "S-B1L", "S-B1U", "S-ALL". Any "M-B1L" or "B-B1L" violates the validation rule!
-  let validBedCode = reservation.unitId || reservation.bedCode;
-  const expectedPrefix = shortRoom === 'Mawenzi' ? 'M'
-    : shortRoom === 'Njoro' ? 'N'
-    : shortRoom === 'Bondeni' ? 'B'
-    : shortRoom === 'Soweto' ? 'S' : '';
-  const currentBedPrefix = (validBedCode || '').charAt(0).toUpperCase();
+  const ROOM_VALID_BEDS: Record<string, string[]> = {
+    'Mawenzi': ['M-S1', 'M-B1L', 'M-B1U', 'M-ALL'],
+    'Njoro': ['N-B1L', 'N-B1U', 'N-B2L', 'N-B2U', 'N-B3L', 'N-B3U', 'N-ALL'],
+    'Bondeni': ['B-B1L', 'B-B1U', 'B-B2L', 'B-B2U', 'B-ALL'],
+    'Soweto': ['S-S1', 'S-B1L', 'S-B1U', 'S-ALL']
+  };
 
-  if (expectedPrefix && currentBedPrefix !== expectedPrefix) {
-    // If bed prefix doesn't match room, auto-reconcile to the valid default bed for this room
-    if (shortRoom === 'Mawenzi') validBedCode = 'M-S1';
-    else if (shortRoom === 'Njoro') validBedCode = 'N-B1L';
-    else if (shortRoom === 'Bondeni') validBedCode = 'B-B1L';
-    else if (shortRoom === 'Soweto') validBedCode = 'S-S1';
+  let validBedCode = (reservation.unitId || reservation.bedCode || '').trim();
+  const allowedBedsForRoom = ROOM_VALID_BEDS[shortRoom] || [];
+  if (allowedBedsForRoom.length > 0 && !allowedBedsForRoom.includes(validBedCode)) {
+    // If not in allowed list, auto-reconcile to the first valid bed for that room
+    validBedCode = allowedBedsForRoom[0];
   }
 
   // Format dates matching spreadsheet ("23 Sep 2026")
@@ -362,13 +374,13 @@ function buildRowForHeaders(
       rowData[idx] = checkInFormatted;
     } else if (col.includes('checkout') || col.includes('departure')) {
       rowData[idx] = checkOutFormatted;
-    } else if (col === 'roomselection' || col === 'selectroom' || col === 'room') {
+    } else if (col === 'roomselection' || col === 'selectroom' || col === 'room' || col.includes('room')) {
       // Must match dropdown validation values in Google Sheet: "Mawenzi", "Njoro", "Bondeni", "Soweto"
       rowData[idx] = shortRoom;
-    } else if (col === 'bedselection' || col === 'selectbedwholeroomcode' || col === 'bedcode' || col === 'unitid' || col === 'bed' || col === 'unit') {
+    } else if (col === 'bedselection' || col === 'selectbed' || col === 'selectbedwholeroomcode' || col === 'bedcode' || col === 'unitid' || col === 'bed' || col === 'unit' || col.includes('bed')) {
       // Must match valid bed codes in Google Sheet for selected room: "N-B1L", "N-B1U", "B-B1L", "S-S1", "M-ALL", etc.
       rowData[idx] = validBedCode;
-    } else if (col === 'status' || col === 'state') {
+    } else if (col === 'status' || col === 'state' || col.includes('status')) {
       rowData[idx] = reservation.status;
     } else if (col === 'currency' || col === 'curr') {
       rowData[idx] = curr;
