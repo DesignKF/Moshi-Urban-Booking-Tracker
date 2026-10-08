@@ -45,9 +45,17 @@ service cloud.firestore {
         && (!('email' in data) || (data.email is string && data.email.size() <= 200))
         && (!('phone' in data) || (data.phone is string && data.phone.size() <= 50))
         && (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000))
+        && (!('guestId' in data) || (data.guestId is string && data.guestId.size() <= 64))
+        && (!('unitId' in data) || (data.unitId is string && data.unitId.size() <= 30))
+        && (!('currency' in data) || (data.currency is string && data.currency.size() <= 10))
+        && (!('platform' in data) || (data.platform is string && data.platform.size() <= 60))
+        && (!('loyalty' in data) || (data.loyalty is string && data.loyalty.size() <= 60))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 50))
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 50))
         && (!('totalAmount' in data) || data.totalAmount is number)
         && (!('paidAmount' in data) || data.paidAmount is number)
         && (!('balanceDue' in data) || data.balanceDue is number)
+        && (!('bedsCount' in data) || data.bedsCount is number)
         && (!('nights' in data) || data.nights is number);
     }
 
@@ -59,17 +67,14 @@ service cloud.firestore {
         && (!('role' in data) || (data.role is string && data.role.size() <= 30));
     }
 
-    // Reservations Collection
+    // Reservations Collection - Publicly viewable hostel bookings & availability
     match /reservations/{reservationId} {
-      allow get, list: if isSignedIn();
-      allow create: if isSignedIn()
-        && isValidId(reservationId)
+      allow get, list: if true;
+      allow create: if isValidId(reservationId)
         && isValidReservation(incoming());
-      allow update: if isSignedIn()
-        && isValidId(reservationId)
+      allow update: if isValidId(reservationId)
         && isValidReservation(incoming());
-      allow delete: if isSignedIn()
-        && isValidId(reservationId);
+      allow delete: if isValidId(reservationId);
     }
 
     // User Profiles Collection

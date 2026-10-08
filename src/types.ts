@@ -110,126 +110,19 @@ export const HOSTEL_ROOMS: HostelRoom[] = [
   }
 ];
 
-// Initial bookings from the Moshi Urban Hostel booking spreadsheet
-export const INITIAL_RESERVATIONS: Reservation[] = [
-  {
-    id: "MU-1",
-    guestName: "Godwin Njau",
-    guestId: "GN-0001",
-    phone: "+255 754 112 344",
-    room: "Mawenzi (Room 1)",
-    bedCode: "M-S1",
-    unitId: "M-S1",
-    bedsCount: 1,
-    checkIn: "2026-09-23",
-    checkOut: "2026-09-27",
-    nights: 4,
-    totalAmount: 80,
-    paidAmount: 80,
-    balanceDue: 0,
-    status: "Checked-in",
-    platform: "Website",
-    loyalty: "New / no recent stays",
-    notes: "Safari traveler"
-  },
-  {
-    id: "MU-2",
-    guestName: "Jimmy Chami",
-    guestId: "JC-0002",
-    phone: "+255 713 882 109",
-    room: "Njoro (Room 2)",
-    bedCode: "N-B1L",
-    unitId: "N-B1L",
-    bedsCount: 1,
-    checkIn: "2026-09-23",
-    checkOut: "2026-09-27",
-    nights: 4,
-    totalAmount: 80,
-    paidAmount: 80,
-    balanceDue: 0,
-    status: "Checked-in",
-    platform: "Website",
-    loyalty: "New / no recent stays",
-    notes: "Kilimanjaro trek preparation"
-  },
-  {
-    id: "MU-3",
-    guestName: "Dominic Shoo",
-    guestId: "DS-0003",
-    phone: "+255 784 990 415",
-    room: "Bondeni (Room 3)",
-    bedCode: "B-B1L",
-    unitId: "B-B1L",
-    bedsCount: 1,
-    checkIn: "2026-10-05",
-    checkOut: "2026-10-10",
-    nights: 5,
-    totalAmount: 100,
-    paidAmount: 0,
-    balanceDue: 100,
-    status: "Checked-in",
-    platform: "Direct Booking",
-    loyalty: "New / no recent stays",
-    notes: "Group coordinator"
-  },
-  {
-    id: "MU-4",
-    guestName: "Jackson Shoo",
-    guestId: "JS-0004",
-    phone: "+255 655 432 198",
-    room: "Soweto (Room 4)",
-    bedCode: "S-S1",
-    unitId: "S-S1",
-    bedsCount: 1,
-    checkIn: "2026-09-23",
-    checkOut: "2026-09-24",
-    nights: 1,
-    totalAmount: 20,
-    paidAmount: 20,
-    balanceDue: 0,
-    status: "Checked-in",
-    platform: "Direct Booking",
-    loyalty: "New / no recent stays",
-    notes: "Transit guest"
-  },
-  {
-    id: "MU-5",
-    guestName: "Brian Kimario",
-    guestId: "BK-0005",
-    phone: "+255 712 345 678",
-    room: "Njoro (Room 2)",
-    bedCode: "N-B1U",
-    unitId: "N-B1U",
-    bedsCount: 1,
-    checkIn: "2026-09-25",
-    checkOut: "2026-09-26",
-    nights: 1,
-    totalAmount: 20,
-    paidAmount: 20,
-    balanceDue: 0,
-    status: "Checked-in",
-    platform: "Direct Booking",
-    loyalty: "New / no recent stays",
-    notes: "Weekend stay"
-  },
-  {
-    id: "MU-6",
-    guestName: "Gift Family",
-    guestId: "GS-0006",
-    phone: "+255 765 998 877",
-    room: "Bondeni (Room 3)",
-    bedCode: "B-ALL",
-    unitId: "B-ALL",
-    bedsCount: 4,
-    checkIn: "2026-09-30",
-    checkOut: "2026-10-05",
-    nights: 5,
-    totalAmount: 100,
-    paidAmount: 100,
-    balanceDue: 0,
-    status: "Confirmed",
-    platform: "Airbnb",
-    loyalty: "New / no recent stays",
-    notes: "Family booking"
-  }
-];
+export interface ChangeLogEntry {
+  id: string;
+  action: 'create' | 'update' | 'delete' | 'status_change' | 'check_in' | 'check_out' | 'payment' | 'sync' | 'revert';
+  title: string;
+  description: string;
+  targetId?: string;
+  guestName?: string;
+  timestamp: string; // ISO date string
+  user: string;
+  diffSummary?: string;
+  snapshotBefore?: Reservation[];
+}
+
+// Initial bookings (empty for fresh start)
+export const INITIAL_RESERVATIONS: Reservation[] = [];
+

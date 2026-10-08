@@ -147,6 +147,25 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
   }
 }
 
+// Clear all reservations from Firestore
+export async function clearAllReservationsFromFirestore(): Promise<number> {
+  const path = 'reservations';
+  try {
+    const q = query(collection(db, path));
+    const snapshot = await getDocs(q);
+    let count = 0;
+    const promises: Promise<void>[] = [];
+    snapshot.forEach(docSnap => {
+      promises.push(deleteDoc(docSnap.ref));
+      count++;
+    });
+    await Promise.all(promises);
+    return count;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
+  }
+}
+
 // Real-time listener for reservations
 export function subscribeToReservations(
   onData: (reservations: Reservation[]) => void,

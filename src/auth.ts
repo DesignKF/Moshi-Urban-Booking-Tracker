@@ -41,11 +41,11 @@ export const initAuth = (
       const tokenTimeStr = localStorage.getItem('google_workspace_token_timestamp');
       const tokenTime = tokenTimeStr ? parseInt(tokenTimeStr, 10) : 0;
       
-      // If there is no timestamp recorded or the token is older than 50 minutes, it is expired
+      // If there is no timestamp recorded or the token is older than 45 minutes, it is expired
       const isTokenValid = Boolean(
         storedToken && 
         tokenTime > 0 && 
-        (Date.now() - tokenTime < 50 * 60 * 1000)
+        (Date.now() - tokenTime < 45 * 60 * 1000)
       );
 
       if (isTokenValid && storedToken) {
@@ -84,15 +84,22 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 };
 
 export const getAccessToken = async (): Promise<string | null> => {
+  if (!cachedAccessToken) {
+    cachedAccessToken = localStorage.getItem('google_workspace_access_token');
+  }
+  if (!cachedAccessToken) {
+    return null;
+  }
   const tokenTimeStr = localStorage.getItem('google_workspace_token_timestamp');
-  const tokenTime = tokenTimeStr ? parseInt(tokenTimeStr, 10) : 0;
-  // If no timestamp or older than 50 min, token is considered expired
-  if (!tokenTime || Date.now() - tokenTime > 50 * 60 * 1000) {
+  if (!tokenTimeStr) {
     clearAccessToken();
     return null;
   }
-  if (!cachedAccessToken) {
-    cachedAccessToken = localStorage.getItem('google_workspace_access_token');
+  const tokenTime = parseInt(tokenTimeStr, 10);
+  // If older than 45 min, token is considered expired
+  if (!tokenTime || Date.now() - tokenTime > 45 * 60 * 1000) {
+    clearAccessToken();
+    return null;
   }
   return cachedAccessToken;
 };
