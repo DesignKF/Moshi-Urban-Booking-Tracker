@@ -1,3 +1,4 @@
+import { exactBookingRow, clearBookingsSafely, inspectWorkbookErrors, writeBookingSafely } from './sheetSafety.mjs';
 import { Reservation } from './types';
 
 export interface SheetFile {
@@ -9,7 +10,7 @@ export interface SheetFile {
 // 1. Search Google Drive for spreadsheets (both My Drive and Shared with Me / Team Drives)
 export async function listUserSpreadsheets(accessToken: string): Promise<SheetFile[]> {
   try {
-    const q = "mimeType='application/vnd.google.apps.spreadsheet' and trashed=false";
+    const q = "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false";
     // Standard Drive v3 list query
     const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
       q
@@ -315,13 +316,15 @@ export function parseSheetToReservations(rows: string[][]): Reservation[] {
 
     // Parse amounts
     const curr = val(currencyIdx).toUpperCase() === 'TZS' ? 'TZS' : 'USD';
-    let totalAmt = parseMoneyNumber(val(grossIdx));
-    let paidAmt = parseMoneyNumber(val(depositIdx));
-    let balance = parseMoneyNumber(val(balanceIdx));
+    const fxIdx = normalizedHeaders.indexOf('savedtzsperusd');
+    const fx = Number(val(fxIdx).replace(/,/g, '')) || 2645;
+    let totalAmt = parseMoneyNumber(val(grossIdx), curr, fx);
+    const otherIdx = normalizedHeaders.indexOf('otherreceived');
+    const refundIdx = normalizedHeaders.indexOf('refundspaid');
+    let paidAmt = parseMoneyNumber(val(depositIdx), curr, fx) + parseMoneyNumber(val(otherIdx), curr, fx) - parseMoneyNumber(val(refundIdx), curr, fx);
+    let balance = parseMoneyNumber(val(balanceIdx), curr, fx);
 
-    if (totalAmt === 0 && nights > 0) {
-      totalAmt = nights * 20;
-    }
+
 
     const status = val(statusIdx) || 'Confirmed';
     let rowGuestId = val(guestIdIdx);
@@ -1205,124 +1208,54 @@ export function normalizeStatusForSheet(status: string): string {
 }
 
 // Helper to construct exact row array based on spreadsheet headers
-export function buildRowForHeaders(
-  rawHeaders: string[],
-  reservation: Reservation,
-  existingRow?: string[]
-): string[] {
-  const maxLen = Math.max(rawHeaders.length, existingRow ? existingRow.length : 0);
-  const rowData: string[] = existingRow && existingRow.length > 0
-    ? [...existingRow]
-    : new Array(maxLen).fill('');
-
-  while (rowData.length < rawHeaders.length) {
-    rowData.push('');
-  }
-
-  const normalizedHeaders = rawHeaders.map(h => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
-
-  // Get simple room name (e.g., "Bondeni" instead of "Bondeni (Room 3)")
-  let shortRoom = reservation.room;
-  if (shortRoom.includes('Njoro')) shortRoom = 'Njoro';
-  else if (shortRoom.includes('Bondeni')) shortRoom = 'Bondeni';
-  else if (shortRoom.includes('Mawenzi')) shortRoom = 'Mawenzi';
-  else if (shortRoom.includes('Soweto')) shortRoom = 'Soweto';
-
-  // Ensure Bed Code belongs to shortRoom to satisfy Google Sheets dropdown data validation
-  const ROOM_VALID_BEDS: Record<string, string[]> = {
-    'Mawenzi': ['M-S1', 'M-B1L', 'M-B1U', 'M-ALL'],
-    'Njoro': ['N-B1L', 'N-B1U', 'N-B2L', 'N-B2U', 'N-B3L', 'N-B3U', 'N-ALL'],
-    'Bondeni': ['B-B1L', 'B-B1U', 'B-B2L', 'B-B2U', 'B-ALL'],
-    'Soweto': ['S-S1', 'S-B1L', 'S-B1U', 'S-ALL']
+export function buildRowForHeaders(rawHeaders: string[], reservation: Reservation, existingRow: string[] = []): string[] {
+  const normalized = rawHeaders.map(h => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const row = Array.from({ length: rawHeaders.length }, (_, i) => existingRow[i] || '');
+  const set = (names: string[], value: string) => normalized.forEach((h, i) => { if (names.includes(h)) row[i] = value; });
+  const readAmount = (header: string) => {
+    const i = normalized.indexOf(header);
+    return i < 0 ? 0 : Number(String(existingRow[i] || '0').replace(/,/g, '')) || 0;
   };
-
-  let validBedCode = (reservation.unitId || reservation.bedCode || '').trim();
-  const allowedBedsForRoom = ROOM_VALID_BEDS[shortRoom] || [];
-  if (allowedBedsForRoom.length > 0 && !allowedBedsForRoom.includes(validBedCode)) {
-    validBedCode = allowedBedsForRoom[0];
+  const currency = reservation.currency || 'USD';
+  const fx = currency === 'TZS' ? (readAmount('savedtzsperusd') || 2645) : 1;
+  const money = (n: number) => (n * fx).toFixed(2);
+  const room = reservation.room.replace(/\s*\(Room \d+\)/, '').trim();
+  const bed = (reservation.unitId || reservation.bedCode || '').trim();
+  const prefixes: Record<string, string> = { Njoro: 'N-', Bondeni: 'B-', Mawenzi: 'M-', Soweto: 'S-' };
+  if (bed && prefixes[room] && !bed.startsWith(prefixes[room])) throw new Error('Selected bed does not belong to the selected room.');
+  set(['bookingid', 'reservationid', 'bookingno', 'id', 'ref'], reservation.id);
+  set(['guestname', 'guest', 'name'], reservation.guestName);
+  set(['phonenumber', 'phone', 'mobile', 'whatsapp'], reservation.phone || '');
+  set(['email', 'emailaddress', 'mail'], reservation.email || '');
+  const guestIndex = normalized.indexOf('guestid');
+  set(['guestid', 'gid', 'customerid'], reservation.guestId || existingRow[guestIndex] || generateGuestId(reservation.guestName));
+  set(['platform', 'source', 'channel'], reservation.platform || 'Direct Booking');
+  set(['checkin', 'checkindate', 'arrival', 'arrivaldate'], formatSheetDate(reservation.checkIn));
+  set(['checkout', 'checkoutdate', 'departure', 'departuredate'], formatSheetDate(reservation.checkOut));
+  set(['roomselection', 'selectroom', 'room', 'roomname'], room);
+  set(['bedselection', 'selectbed', 'bedcode', 'unitid', 'bed'], bed);
+  set(['status', 'bookingstatus', 'state'], normalizeStatusForSheet(reservation.status));
+  set(['currency', 'curr'], currency);
+  set(['grossvalue', 'gross', 'totalamount', 'staytotal'], money(reservation.totalAmount));
+  set(['balancedue', 'balance', 'outstanding'], money(reservation.balanceDue));
+  // The app stores net paid. Keep the separate receipt/refund entries intact.
+  set(['depositreceived', 'deposit', 'paidamount'], (reservation.paidAmount * fx - readAmount('otherreceived') + readAmount('refundspaid')).toFixed(2));
+  set(['notes', 'comments', 'requests'], reservation.notes || '');
+  set(['nights', 'duration'], String(reservation.nights));
+  if (normalized.includes('pricingmode') && normalized.includes('manualgrosstotal')) {
+    set(['pricingmode'], 'Manual total');
+    set(['manualgrosstotal'], money(reservation.totalAmount));
+    if (currency === 'TZS') set(['savedtzsperusd'], String(fx));
   }
-
-  // Format dates matching spreadsheet ("23 Sep 2026")
-  const checkInFormatted = formatSheetDate(reservation.checkIn);
-  const checkOutFormatted = formatSheetDate(reservation.checkOut);
-
-  // Currency & Values
-  const curr = reservation.currency || 'USD';
-  const grossFormatted = curr === 'TZS'
-    ? `${(reservation.totalAmount * 2645).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-    : `${reservation.totalAmount.toFixed(2)}`;
-
-  const balanceFormatted = curr === 'TZS'
-    ? `${(reservation.balanceDue * 2645).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-    : `${reservation.balanceDue.toFixed(2)}`;
-
-  const depositFormatted = reservation.paidAmount > 0
-    ? (curr === 'TZS'
-        ? `${(reservation.paidAmount * 2645).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-        : `${reservation.paidAmount.toFixed(2)}`)
-    : '–';
-
-  // Standard guest ID format: First initial + Last initial + unique random number (e.g. "GN-4921")
-  let standardGuestId = reservation.guestId;
-  if (!standardGuestId || standardGuestId.trim() === '') {
-    standardGuestId = generateGuestId(reservation.guestName);
-  }
-
-  normalizedHeaders.forEach((col, idx) => {
-    if (col === 'bookingid' || col === 'id' || col === 'ref') {
-      rowData[idx] = reservation.id;
-    } else if (col === 'guestname' || col === 'guest' || col === 'name') {
-      rowData[idx] = reservation.guestName;
-    } else if (col.includes('phone') || col.includes('whatsapp') || col.includes('mobile')) {
-      rowData[idx] = reservation.phone ? reservation.phone.replace(/[^0-9+]/g, '').replace(/^\+/, '') : '';
-    } else if (col.includes('email') || col.includes('mail')) {
-      rowData[idx] = reservation.email || '';
-    } else if (col === 'guestid' || col === 'gid' || col === 'customerid') {
-      rowData[idx] = standardGuestId;
-    } else if (col === 'platform' || col === 'source' || col === 'channel') {
-      rowData[idx] = reservation.platform || 'Direct Booking';
-    } else if (col.includes('checkin') || col.includes('arrival')) {
-      rowData[idx] = checkInFormatted;
-    } else if (col.includes('checkout') || col.includes('departure')) {
-      rowData[idx] = checkOutFormatted;
-    } else if (col === 'roomselection' || col === 'selectroom' || (col.includes('room') && !col.includes('bed'))) {
-      rowData[idx] = shortRoom;
-    } else if (col === 'bedselection' || col === 'selectbed' || col.includes('bed') || col.includes('unit')) {
-      rowData[idx] = validBedCode;
-    } else if (col === 'status' || col === 'state' || col.includes('status')) {
-      rowData[idx] = normalizeStatusForSheet(reservation.status);
-    } else if (col === 'currency' || col === 'curr') {
-      rowData[idx] = curr;
-    } else if (col.includes('gross') || col.includes('total') || col.includes('staytotal') || col.includes('price')) {
-      rowData[idx] = grossFormatted;
-    } else if (col.includes('balance') || col.includes('due') || col.includes('outstanding')) {
-      rowData[idx] = balanceFormatted;
-    } else if (col.includes('deposit') || col.includes('paid')) {
-      rowData[idx] = depositFormatted;
-    } else if (col.includes('otherreceived')) {
-      rowData[idx] = '–';
-    } else if (col.includes('refunds')) {
-      rowData[idx] = '–';
-    } else if (col.includes('holdexpires')) {
-      rowData[idx] = '';
-    } else if (col.includes('notes') || col.includes('comment') || col.includes('request')) {
-      rowData[idx] = reservation.notes || '';
-    } else if (col === 'nights' || col === 'night' || col === 'duration') {
-      rowData[idx] = String(reservation.nights || 1);
-    }
-  });
-
-  return rowData;
+  return row;
 }
 
-function parseMoneyNumber(val: string): number {
+function parseMoneyNumber(val: string, currency = 'USD', fx = 2645): number {
   if (!val) return 0;
   const cleaned = val.replace(/[$€£TZS,]/gi, '').trim();
   const num = parseFloat(cleaned);
   if (isNaN(num)) return 0;
-  if (num > 1000) {
-    return Math.round(num / 2645);
-  }
+  if (currency === 'TZS') return num / fx;
   return num;
 }
 
@@ -1337,834 +1270,39 @@ function normalizeDate(str: string): string {
 }
 
 // Find 1-based row index for a reservation in a spreadsheet
-export function findRowIndexForReservation(
-  rows: string[][],
-  headerRowIndex: number,
-  reservation: { id: string; guestName?: string; guestId?: string; phone?: string }
-): number {
-  if (!rows || rows.length === 0 || headerRowIndex === -1) return -1;
-  const rawHeaders = rows[headerRowIndex] || [];
-  const normalizedHeaders = rawHeaders.map(h => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
-
-  const getColIdx = (candidates: string[]) =>
-    normalizedHeaders.findIndex(h => candidates.some(c => h.includes(c)));
-
-  const idIdx = getColIdx(['bookingid', 'id', 'ref', 'bookingno', 'reservationid', 'no']);
-  const guestIdx = getColIdx(['guestname', 'guest', 'name']);
-  const guestIdIdx = getColIdx(['guestid', 'gid', 'customerid']);
-
-  const clean = (s: any) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-  const targetIdClean = clean(reservation.id);
-  const targetIdNum = reservation.id ? reservation.id.replace(/[^0-9]/g, '') : '';
-  const targetGuestClean = reservation.guestName ? clean(reservation.guestName) : '';
-  const targetGuestIdClean = reservation.guestId ? clean(reservation.guestId) : '';
-
-  const isTotalOrSummaryRow = (rArr: string[]) => {
-    if (!rArr || rArr.length === 0) return false;
-    const str = rArr.join(' ').toLowerCase();
-    return str.includes('total') || str.includes('summary');
-  };
-
-  // 1. Primary match: Booking ID
-  if (idIdx >= 0 && targetIdClean) {
-    for (let r = headerRowIndex + 1; r < rows.length; r++) {
-      const row = rows[r];
-      if (!row || row.length === 0 || isTotalOrSummaryRow(row)) continue;
-      const cellVal = clean(row[idIdx]);
-      if (cellVal && cellVal === targetIdClean) {
-        return r + 1;
-      }
-      const cellNum = String(row[idIdx] || '').replace(/[^0-9]/g, '');
-      if (cellNum && targetIdNum && cellNum === targetIdNum && (cellVal.includes('mu') || targetIdClean.includes('mu'))) {
-        return r + 1;
-      }
-    }
-  }
-
-  // 2. Secondary match: Guest ID
-  if (guestIdIdx >= 0 && targetGuestIdClean) {
-    for (let r = headerRowIndex + 1; r < rows.length; r++) {
-      const row = rows[r];
-      if (!row || row.length === 0 || isTotalOrSummaryRow(row)) continue;
-      const cellVal = clean(row[guestIdIdx]);
-      if (cellVal && cellVal === targetGuestIdClean) {
-        return r + 1;
-      }
-    }
-  }
-
-  // 3. Tertiary match: Guest Name
-  if (guestIdx >= 0 && targetGuestClean) {
-    for (let r = headerRowIndex + 1; r < rows.length; r++) {
-      const row = rows[r];
-      if (!row || row.length === 0 || isTotalOrSummaryRow(row)) continue;
-      const cellGuest = clean(row[guestIdx]);
-      if (cellGuest && cellGuest === targetGuestClean) {
-        return r + 1;
-      }
-    }
-  }
-
-  // 4. Fallback search in column 0 or 1
-  for (let r = headerRowIndex + 1; r < rows.length; r++) {
-    const row = rows[r];
-    if (!row || row.length === 0 || isTotalOrSummaryRow(row)) continue;
-    if (targetIdClean && clean(row[0]) === targetIdClean) {
-      return r + 1;
-    }
-    if (targetGuestClean && clean(row[1]) === targetGuestClean) {
-      return r + 1;
-    }
-  }
-
-  return -1;
+export function findRowIndexForReservation(rows: string[][], headerRowIndex: number, reservation: { id: string; guestName?: string; guestId?: string; phone?: string }): number {
+  return exactBookingRow(rows, headerRowIndex, reservation.id);
 }
 
-// 5. Append new reservation row directly to Google Sheets matching header columns
-export async function appendReservationToSheet(
-  spreadsheetId: string,
-  sheetName: string,
-  reservation: Reservation,
-  accessToken: string
-) {
-  const scanRange = formatA1Range(sheetName, 'A1:Z500');
-  let existingRows: string[][] = [];
-  try {
-    existingRows = await readSheetRows(spreadsheetId, scanRange, accessToken);
-  } catch (e) {
-    console.warn('Could not scan sheet headers:', e);
-  }
-
-  let headerRowIndex = -1;
-  for (let i = 0; i < Math.min(existingRows.length, 35); i++) {
-    const rowStr = existingRows[i].join(' ').toLowerCase();
-    if (rowStr.includes('booking id') || (rowStr.includes('guest') && (rowStr.includes('check-in') || rowStr.includes('check in')))) {
-      headerRowIndex = i;
-      break;
-    }
-  }
-
-  if (headerRowIndex !== -1) {
-    const rawHeaders = existingRows[headerRowIndex] || [];
-    const normalizedHeaders = rawHeaders.map(h => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
-    const idCol = normalizedHeaders.findIndex(h => ['bookingid', 'id', 'ref'].some(c => h.includes(c)));
-    const guestCol = normalizedHeaders.findIndex(h => ['guestname', 'guest', 'name'].some(c => h.includes(c)));
-
-    const rowData = buildRowForHeaders(rawHeaders, reservation);
-    const endColLetter = colIndexToLetter(rowData.length);
-
-    // Identify if there is a Total / Summary row
-    let totalRow1Based = -1;
-    for (let r = headerRowIndex + 1; r < existingRows.length; r++) {
-      const row = existingRows[r];
-      if (row) {
-        const rowStr = row.join(' ').toLowerCase();
-        if (rowStr.includes('total') || rowStr.includes('summary')) {
-          totalRow1Based = r + 1;
-          break;
-        }
-      }
-    }
-
-    // Look for first blank row in existing template rows (after header, and before any Total row)
-    let nextRow = existingRows.length + 1;
-    let foundBlank = false;
-    const maxSearchRow = totalRow1Based > 0 ? totalRow1Based - 1 : existingRows.length;
-
-    for (let r = headerRowIndex + 1; r < maxSearchRow; r++) {
-      const row = existingRows[r];
-      if (!row || row.length === 0) {
-        nextRow = r + 1;
-        foundBlank = true;
-        break;
-      }
-      const bId = idCol >= 0 && row[idCol] !== undefined ? String(row[idCol]).trim() : String(row[0] || '').trim();
-      const gName = guestCol >= 0 && row[guestCol] !== undefined ? String(row[guestCol]).trim() : String(row[1] || '').trim();
-      if (!bId && !gName) {
-        nextRow = r + 1;
-        foundBlank = true;
-        break;
-      }
-    }
-
-    if (foundBlank) {
-      const targetRange = formatA1Range(sheetName, `A${nextRow}:${endColLetter}${nextRow}`);
-      const encodedRange = encodeURIComponent(targetRange);
-
-      const res = await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}?valueInputOption=USER_ENTERED`,
-        {
-          method: 'PUT',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            values: [rowData],
-          }),
-        }
-      );
-
-      if (res.ok) {
-        return await res.json();
-      }
-    }
-
-    // If there is a Total row and no blank row above it, insert row directly above Total row
-    if (totalRow1Based > 0) {
-      try {
-        const details = await getSpreadsheetDetails(spreadsheetId, accessToken);
-        const targetSheet = details.sheets.find(s => s.title.toLowerCase() === sheetName.toLowerCase()) || details.sheets[0];
-        if (targetSheet) {
-          const insertRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              requests: [
-                {
-                  insertDimension: {
-                    range: {
-                      sheetId: targetSheet.sheetId,
-                      dimension: 'ROWS',
-                      startIndex: totalRow1Based - 1,
-                      endIndex: totalRow1Based,
-                    },
-                    inheritFromBefore: true,
-                  },
-                },
-              ],
-            }),
-          });
-
-          if (insertRes.ok) {
-            const insertRange = formatA1Range(sheetName, `A${totalRow1Based}:${endColLetter}${totalRow1Based}`);
-            const putRes = await fetch(
-              `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(insertRange)}?valueInputOption=USER_ENTERED`,
-              {
-                method: 'PUT',
-                headers: {
-                  Authorization: `Bearer ${accessToken}`,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ values: [rowData] }),
-              }
-            );
-            if (putRes.ok) {
-              return await putRes.json();
-            }
-          }
-        }
-      } catch (insertErr) {
-        console.warn('Could not insert row above total, falling back to append:', insertErr);
-      }
-    }
-
-    // Append to sheet
-    const appendRange = formatA1Range(sheetName, `A:${endColLetter}`);
-    const encodedAppend = encodeURIComponent(appendRange);
-
-    const res = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedAppend}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          values: [rowData],
-        }),
-      }
-    );
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error?.message || `Failed to append reservation to sheet (${res.status})`);
-    }
-
-    return await res.json();
-  }
-
-  // Fallback if no header was found
-  const defaultRow = [
-    reservation.id,
-    reservation.guestName,
-    reservation.phone ? reservation.phone.replace(/[^0-9+]/g, '').replace(/^\+/, '') : '',
-    reservation.email || '',
-    reservation.guestId || `GS-${reservation.id.replace(/[^0-9]/g, '').padStart(4, '0')}`,
-    reservation.platform || 'Direct Booking',
-    formatSheetDate(reservation.checkIn),
-    formatSheetDate(reservation.checkOut),
-    reservation.room.replace(/\s*\(Room \d+\)/, ''),
-    reservation.unitId || reservation.bedCode,
-    normalizeStatusForSheet(reservation.status),
-    reservation.currency || 'USD',
-    reservation.totalAmount.toFixed(2),
-    reservation.balanceDue.toFixed(2),
-    reservation.paidAmount > 0 ? reservation.paidAmount.toFixed(2) : '–',
-    '–',
-    '–',
-    '',
-    reservation.notes || '',
-    String(reservation.nights || 1)
-  ];
-
-  const range = formatA1Range(sheetName, 'A:T');
-  const encodedRange = encodeURIComponent(range);
-
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        values: [defaultRow],
-      }),
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Failed to append reservation (${res.status})`);
-  }
-
-  return await res.json();
+// Mutations preserve physical rows, calculated cells and exact booking identity.
+export async function appendReservationToSheet(spreadsheetId: string, sheetName: string, reservation: Reservation, accessToken: string) {
+  return writeBookingSafely(spreadsheetId, sheetName, reservation, accessToken, buildRowForHeaders, true);
 }
-
-// 6. Update existing reservation row in Google Sheets
-export async function updateReservationInSheet(
-  spreadsheetId: string,
-  sheetName: string,
-  reservation: Reservation,
-  accessToken: string
-) {
-  const range = formatA1Range(sheetName, 'A1:Z500');
-  const existingRows = await readSheetRows(spreadsheetId, range, accessToken);
-
-  let headerRowIndex = -1;
-  for (let i = 0; i < Math.min(existingRows.length, 35); i++) {
-    const rowStr = existingRows[i].join(' ').toLowerCase();
-    if (rowStr.includes('booking id') || (rowStr.includes('guest') && (rowStr.includes('check-in') || rowStr.includes('check in')))) {
-      headerRowIndex = i;
-      break;
-    }
-  }
-
-  if (headerRowIndex === -1 && existingRows.length > 0) {
-    headerRowIndex = 0;
-  }
-
-  const targetRowIndex = findRowIndexForReservation(existingRows, headerRowIndex, reservation);
-
-  if (targetRowIndex === -1) {
-    // If not found in sheet, append as new row
-    return appendReservationToSheet(spreadsheetId, sheetName, reservation, accessToken);
-  }
-
-  const rawHeaders = headerRowIndex !== -1 ? existingRows[headerRowIndex] : existingRows[0] || [];
-  const existingRow = existingRows[targetRowIndex - 1] || [];
-  const rowData = buildRowForHeaders(rawHeaders, reservation, existingRow);
-  const endColLetter = colIndexToLetter(rowData.length);
-
-  const updateRange = formatA1Range(sheetName, `A${targetRowIndex}:${endColLetter}${targetRowIndex}`);
-  const encodedRange = encodeURIComponent(updateRange);
-
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}?valueInputOption=USER_ENTERED`,
-    {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        values: [rowData],
-      }),
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Failed to update reservation in sheet row ${targetRowIndex} (${res.status})`);
-  }
-
-  return await res.json();
+export async function updateReservationInSheet(spreadsheetId: string, sheetName: string, reservation: Reservation, accessToken: string) {
+  return writeBookingSafely(spreadsheetId, sheetName, reservation, accessToken, buildRowForHeaders, false);
 }
-
-// 7. Delete single reservation row from Google Sheets by Booking ID
-export async function deleteReservationFromSheet(
-  spreadsheetId: string,
-  sheetName: string,
-  bookingId: string,
-  accessToken: string
-): Promise<boolean> {
-  const details = await getSpreadsheetDetails(spreadsheetId, accessToken);
-  const targetSheet = details.sheets.find(s => s.title.toLowerCase() === sheetName.toLowerCase()) || details.sheets[0];
-  if (!targetSheet) throw new Error(`Tab "${sheetName}" not found in spreadsheet.`);
-  const numericSheetId = targetSheet.sheetId;
-
-  const scanRange = formatA1Range(sheetName, 'A1:Z500');
-  const existingRows = await readSheetRows(spreadsheetId, scanRange, accessToken);
-
-  let headerRowIndex = -1;
-  for (let i = 0; i < Math.min(existingRows.length, 35); i++) {
-    const rowStr = existingRows[i].join(' ').toLowerCase();
-    if (rowStr.includes('booking id') || (rowStr.includes('guest') && (rowStr.includes('check-in') || rowStr.includes('check in')))) {
-      headerRowIndex = i;
-      break;
-    }
-  }
-
-  const dummyReservation: Partial<Reservation> = { id: bookingId };
-  const target1BasedRow = findRowIndexForReservation(existingRows, headerRowIndex, dummyReservation as Reservation);
-
-  if (target1BasedRow === -1) {
-    console.warn(`Booking ${bookingId} not found in sheet for deletion.`);
-    return false;
-  }
-
-  const rowIndex0Based = target1BasedRow - 1;
-
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      requests: [
-        {
-          deleteDimension: {
-            range: {
-              sheetId: numericSheetId,
-              dimension: 'ROWS',
-              startIndex: rowIndex0Based,
-              endIndex: rowIndex0Based + 1,
-            },
-          },
-        },
-      ],
-    }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Failed to delete row in sheet (${res.status})`);
-  }
-
-  // Automatically heal and protect formulas from #REF! errors
-  try {
-    await fixSheetRefErrors(spreadsheetId, sheetName, accessToken);
-  } catch (healErr) {
-    console.warn('Post-deletion formula healing check note:', healErr);
-  }
-
-  return true;
+export async function deleteReservationFromSheet(spreadsheetId: string, sheetName: string, bookingId: string, accessToken: string): Promise<boolean> {
+  return (await clearBookingsSafely(spreadsheetId, sheetName, [bookingId], accessToken)) > 0;
 }
-
-// 8. Delete multiple reservation rows from Google Sheets in a single batch
-export async function deleteBatchReservationsFromSheet(
-  spreadsheetId: string,
-  sheetName: string,
-  bookingIds: string[],
-  accessToken: string
-): Promise<number> {
-  if (!bookingIds || bookingIds.length === 0) return 0;
-
-  const details = await getSpreadsheetDetails(spreadsheetId, accessToken);
-  const targetSheet = details.sheets.find(s => s.title.toLowerCase() === sheetName.toLowerCase()) || details.sheets[0];
-  if (!targetSheet) throw new Error(`Tab "${sheetName}" not found in spreadsheet.`);
-  const numericSheetId = targetSheet.sheetId;
-
-  const scanRange = formatA1Range(sheetName, 'A1:Z500');
-  const existingRows = await readSheetRows(spreadsheetId, scanRange, accessToken);
-
-  let headerRowIndex = -1;
-  for (let i = 0; i < Math.min(existingRows.length, 35); i++) {
-    const rowStr = existingRows[i].join(' ').toLowerCase();
-    if (rowStr.includes('booking id') || (rowStr.includes('guest') && (rowStr.includes('check-in') || rowStr.includes('check in')))) {
-      headerRowIndex = i;
-      break;
-    }
-  }
-
-  const rowIndices0Based: number[] = [];
-  for (const bId of bookingIds) {
-    const target1Based = findRowIndexForReservation(existingRows, headerRowIndex, { id: bId } as Reservation);
-    if (target1Based > 0 && !rowIndices0Based.includes(target1Based - 1)) {
-      rowIndices0Based.push(target1Based - 1);
-    }
-  }
-
-  if (rowIndices0Based.length === 0) return 0;
-
-  // IMPORTANT: Sort descending so deleting higher indices does not affect indices of previous rows
-  rowIndices0Based.sort((a, b) => b - a);
-
-  const requests = rowIndices0Based.map(idx => ({
-    deleteDimension: {
-      range: {
-        sheetId: numericSheetId,
-        dimension: 'ROWS',
-        startIndex: idx,
-        endIndex: idx + 1,
-      },
-    },
-  }));
-
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ requests }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Failed to batch delete rows from sheet (${res.status})`);
-  }
-
-  // Automatically heal and protect formulas from #REF! errors
-  try {
-    await fixSheetRefErrors(spreadsheetId, sheetName, accessToken);
-  } catch (healErr) {
-    console.warn('Post-batch-deletion formula healing check note:', healErr);
-  }
-
-  return rowIndices0Based.length;
+export async function deleteBatchReservationsFromSheet(spreadsheetId: string, sheetName: string, bookingIds: string[], accessToken: string): Promise<number> {
+  if (!bookingIds.length) return 0;
+  return clearBookingsSafely(spreadsheetId, sheetName, bookingIds, accessToken);
 }
-
-// 8b. Remove all booking rows from Google Sheet (keeping headers and clean sheet layout)
-export async function clearAllBookingsFromSheet(
-  spreadsheetId: string,
-  sheetName: string,
-  accessToken: string
-): Promise<{ deletedCount: number; message: string }> {
-  const details = await getSpreadsheetDetails(spreadsheetId, accessToken);
-  const targetSheet = details.sheets.find(s => s.title.toLowerCase() === sheetName.toLowerCase()) || details.sheets[0];
-  if (!targetSheet) throw new Error(`Tab "${sheetName}" not found in spreadsheet.`);
-  const numericSheetId = targetSheet.sheetId;
-
-  const scanRange = formatA1Range(sheetName, 'A1:Z500');
-  const existingRows = await readSheetRows(spreadsheetId, scanRange, accessToken);
-
-  if (!existingRows || existingRows.length === 0) {
-    return { deletedCount: 0, message: 'Sheet is already empty.' };
-  }
-
-  let headerRowIndex = -1;
-  for (let i = 0; i < Math.min(existingRows.length, 35); i++) {
-    const rowStr = existingRows[i].join(' ').toLowerCase();
-    if (rowStr.includes('booking id') || (rowStr.includes('guest') && (rowStr.includes('check-in') || rowStr.includes('check in')))) {
-      headerRowIndex = i;
-      break;
-    }
-  }
-
-  if (headerRowIndex === -1) {
-    headerRowIndex = 0;
-  }
-
-  // Check if there is a "Total" or summary row below header
-  let totalRowIndex = -1;
-  for (let r = headerRowIndex + 1; r < existingRows.length; r++) {
-    const row = existingRows[r];
-    if (!row) continue;
-    const firstCell = String(row[0] || '').trim().toLowerCase();
-    const secondCell = String(row[1] || '').trim().toLowerCase();
-    const thirdCell = String(row[2] || '').trim().toLowerCase();
-    if (
-      firstCell.startsWith('total') ||
-      secondCell.startsWith('total') ||
-      thirdCell.startsWith('total') ||
-      firstCell === 'sum' ||
-      firstCell === 'grand total'
-    ) {
-      totalRowIndex = r;
-      break;
-    }
-  }
-
-  const startRow0Based = headerRowIndex + 1;
-  const endRow0Based = totalRowIndex !== -1 ? totalRowIndex : existingRows.length;
-
-  if (endRow0Based <= startRow0Based) {
-    // No data rows to delete
-    // Still run formula healing in case of any dangling #REF!
-    try {
-      await fixSheetRefErrors(spreadsheetId, sheetName, accessToken);
-    } catch (healErr) {
-      console.warn('Formula healing check note:', healErr);
-    }
-    return { deletedCount: 0, message: 'No data rows to delete in sheet tab.' };
-  }
-
-  const rowsCountToDelete = endRow0Based - startRow0Based;
-
-  const requests = [
-    {
-      deleteDimension: {
-        range: {
-          sheetId: numericSheetId,
-          dimension: 'ROWS',
-          startIndex: startRow0Based,
-          endIndex: endRow0Based,
-        },
-      },
-    },
-  ];
-
-  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ requests }),
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Failed to clear rows from sheet (${res.status})`);
-  }
-
-  // Automatically heal and protect formulas from #REF! errors
-  try {
-    await fixSheetRefErrors(spreadsheetId, sheetName, accessToken);
-  } catch (healErr) {
-    console.warn('Post-clear formula healing check note:', healErr);
-  }
-
-  return {
-    deletedCount: rowsCountToDelete,
-    message: `Successfully removed all ${rowsCountToDelete} booking rows from sheet tab "${sheetName}".`,
-  };
+export async function clearAllBookingsFromSheet(spreadsheetId: string, sheetName: string, accessToken: string): Promise<{ deletedCount: number; message: string }> {
+  const deletedCount = await clearBookingsSafely(spreadsheetId, sheetName, null, accessToken);
+  return { deletedCount, message: `Cleared ${deletedCount} bookings; rows and formulas were preserved.` };
 }
-
-// 9. Inspect and heal any #REF! errors, broken formulas, or orphaned rows in the Google Sheet
 export interface SheetRepairResult {
   fixedCount: number;
   clearedRows: number;
   repairedFormulas: string[];
+  remainingErrors: number;
+  errorCells: string[];
   message: string;
 }
-
-export async function fixSheetRefErrors(
-  spreadsheetId: string,
-  sheetName: string,
-  accessToken: string
-): Promise<SheetRepairResult> {
-  const details = await getSpreadsheetDetails(spreadsheetId, accessToken);
-  const targetSheet = details.sheets.find(s => s.title.toLowerCase() === sheetName.toLowerCase()) || details.sheets[0];
-  if (!targetSheet) throw new Error(`Tab "${sheetName}" not found in spreadsheet.`);
-  const numericSheetId = targetSheet.sheetId;
-
-  // Read full cell grid metadata including formulas and effective values
-  const rangeStr = formatA1Range(sheetName, 'A1:Z250');
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?includeGridData=true&ranges=${encodeURIComponent(rangeStr)}&fields=sheets(properties,data.rowData.values(userEnteredValue,effectiveValue,formattedValue))`,
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    }
-  );
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Failed to inspect sheet cells for repair (${res.status})`);
-  }
-
-  const data = await res.json();
-  const currentSheet = data.sheets?.find((s: any) => s.properties?.title?.toLowerCase() === sheetName.toLowerCase()) || data.sheets?.[0];
-  const sheetData = currentSheet?.data?.[0];
-  const rowDataList = sheetData?.rowData || [];
-
-  if (rowDataList.length === 0) {
-    return { fixedCount: 0, clearedRows: 0, repairedFormulas: [], message: 'Sheet is empty, no errors found.' };
-  }
-
-  // Identify header row
-  let headerRowIndex = -1;
-  const rawHeaders: string[] = [];
-  for (let r = 0; r < Math.min(rowDataList.length, 35); r++) {
-    const rowValues = rowDataList[r]?.values || [];
-    const rowStr = rowValues.map((v: any) => v?.formattedValue || v?.userEnteredValue?.stringValue || '').join(' ').toLowerCase();
-    if (rowStr.includes('booking id') || (rowStr.includes('guest') && (rowStr.includes('check-in') || rowStr.includes('check in')))) {
-      headerRowIndex = r;
-      rowValues.forEach((v: any) => {
-        rawHeaders.push(v?.formattedValue || v?.userEnteredValue?.stringValue || '');
-      });
-      break;
-    }
-  }
-
-  const normalizedHeaders = rawHeaders.map(h => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
-  const getColIdx = (candidates: string[]) =>
-    normalizedHeaders.findIndex(h => candidates.some(c => h.includes(c)));
-
-  const idColIdx = getColIdx(['bookingid', 'id', 'ref']);
-  const guestColIdx = getColIdx(['guestname', 'guest', 'name']);
-  const grossColIdx = getColIdx(['grossvalue', 'gross', 'staytotal', 'rate', 'price', 'totalamount', 'total']);
-  const balanceColIdx = getColIdx(['balancedue', 'balance', 'outstanding', 'due']);
-  const depositColIdx = getColIdx(['depositreceived', 'deposit', 'paidamount', 'paid', 'received']);
-  const nightsColIdx = getColIdx(['nights', 'night', 'duration']);
-  const checkInColIdx = getColIdx(['checkin', 'arrival', 'startdate', 'from']);
-  const checkOutColIdx = getColIdx(['checkout', 'departure', 'enddate', 'to']);
-
-  const cellUpdates: { range: string; value: string }[] = [];
-  const repairedFormulas: string[] = [];
-  const rowsToDelete0Based: number[] = [];
-
-  for (let r = 0; r < rowDataList.length; r++) {
-    const rowObj = rowDataList[r];
-    const cells = rowObj?.values || [];
-    if (cells.length === 0) continue;
-
-    const rowStrings = cells.map((c: any) => String(c?.formattedValue || c?.userEnteredValue?.stringValue || '').trim());
-    const isTotalRow = rowStrings.some((s: string) => {
-      const lower = s.toLowerCase();
-      return lower === 'total' || lower === 'totals' || lower.startsWith('total ') || lower === 'summary';
-    });
-
-    cells.forEach((cell: any, cIdx: number) => {
-      const errType = cell?.effectiveValue?.errorValue?.type;
-      const formatted = String(cell?.formattedValue || '');
-      const formulaVal = String(cell?.userEnteredValue?.formulaValue || '');
-      const strVal = String(cell?.userEnteredValue?.stringValue || '');
-
-      const isRefError =
-        errType === 'REF' ||
-        errType === 'ERROR' ||
-        formatted.includes('#REF!') ||
-        formulaVal.includes('#REF!') ||
-        strVal.includes('#REF!');
-
-      if (isRefError) {
-        const colLetter = colIndexToLetter(cIdx + 1);
-        const cellA1 = `${sheetName}!${colLetter}${r + 1}`;
-
-        if (isTotalRow) {
-          // Total/Summary row cell
-          const startDataRow = headerRowIndex >= 0 ? headerRowIndex + 2 : 3;
-          const endDataRow = r; // Row immediately above Total row
-          if (endDataRow >= startDataRow) {
-            const fixedFormula = `=IFERROR(SUM(${colLetter}${startDataRow}:${colLetter}${endDataRow}), 0)`;
-            cellUpdates.push({ range: cellA1, value: fixedFormula });
-            repairedFormulas.push(`${colLetter}${r + 1}: ${fixedFormula}`);
-          } else {
-            // No data rows currently between header and total
-            const fixedFormula = `=0`;
-            cellUpdates.push({ range: cellA1, value: fixedFormula });
-            repairedFormulas.push(`${colLetter}${r + 1}: 0 (resilient summary)`);
-          }
-        } else if (headerRowIndex >= 0 && r > headerRowIndex) {
-          // Inside data rows section
-          const bId = idColIdx >= 0 ? rowStrings[idColIdx] : rowStrings[0];
-          const gName = guestColIdx >= 0 ? rowStrings[guestColIdx] : rowStrings[1];
-          const isGhostRow = (!bId || bId.includes('#REF!') || bId.startsWith('#')) &&
-                            (!gName || gName.includes('#REF!') || gName.startsWith('#'));
-
-          if (isGhostRow) {
-            if (!rowsToDelete0Based.includes(r)) {
-              rowsToDelete0Based.push(r);
-            }
-          } else {
-            // Valid booking with broken formula
-            if (cIdx === nightsColIdx && checkInColIdx >= 0 && checkOutColIdx >= 0) {
-              const inCol = colIndexToLetter(checkInColIdx + 1);
-              const outCol = colIndexToLetter(checkOutColIdx + 1);
-              const rowNum = r + 1;
-              const fixFormula = `=IF(AND(ISDATE(${inCol}${rowNum}), ISDATE(${outCol}${rowNum})), ${outCol}${rowNum}-${inCol}${rowNum}, 1)`;
-              cellUpdates.push({ range: cellA1, value: fixFormula });
-              repairedFormulas.push(`${colLetter}${rowNum}: ${fixFormula}`);
-            } else if (cIdx === balanceColIdx && grossColIdx >= 0 && depositColIdx >= 0) {
-              const gCol = colIndexToLetter(grossColIdx + 1);
-              const dCol = colIndexToLetter(depositColIdx + 1);
-              const rowNum = r + 1;
-              const fixFormula = `=IF(ISNUMBER(${gCol}${rowNum}), ${gCol}${rowNum}-IF(ISNUMBER(${dCol}${rowNum}), ${dCol}${rowNum}, 0), 0)`;
-              cellUpdates.push({ range: cellA1, value: fixFormula });
-              repairedFormulas.push(`${colLetter}${rowNum}: ${fixFormula}`);
-            } else {
-              cellUpdates.push({ range: cellA1, value: '' });
-              repairedFormulas.push(`${colLetter}${r + 1}: cleared`);
-            }
-          }
-        } else {
-          // Other cells having #REF!
-          cellUpdates.push({ range: cellA1, value: '' });
-          repairedFormulas.push(`${colLetter}${r + 1}: cleared`);
-        }
-      }
-    });
-  }
-
-  // 1. Write repaired formulas / values
-  if (cellUpdates.length > 0) {
-    const valueData = cellUpdates.map(u => ({
-      range: u.range,
-      values: [[u.value]],
-    }));
-
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        valueInputOption: 'USER_ENTERED',
-        data: valueData,
-      }),
-    });
-  }
-
-  // 2. Remove corrupted ghost rows if any
-  let clearedRowsCount = 0;
-  if (rowsToDelete0Based.length > 0) {
-    rowsToDelete0Based.sort((a, b) => b - a);
-    const deleteRequests = rowsToDelete0Based.map(idx => ({
-      deleteDimension: {
-        range: {
-          sheetId: numericSheetId,
-          dimension: 'ROWS',
-          startIndex: idx,
-          endIndex: idx + 1,
-        },
-      },
-    }));
-
-    const delRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ requests: deleteRequests }),
-    });
-
-    if (delRes.ok) {
-      clearedRowsCount = rowsToDelete0Based.length;
-    }
-  }
-
-  const totalFixed = cellUpdates.length + clearedRowsCount;
-  return {
-    fixedCount: totalFixed,
-    clearedRows: clearedRowsCount,
-    repairedFormulas,
-    message: totalFixed > 0
-      ? `Repaired ${cellUpdates.length} formula/cell errors and removed ${clearedRowsCount} corrupted ghost rows in tab "${sheetName}".`
-      : `Google Sheet tab "${sheetName}" is healthy. Zero #REF! errors found.`,
-  };
+// Kept for existing callers; health checks must not guess formulas or erase evidence.
+export async function fixSheetRefErrors(spreadsheetId: string, _sheetName: string, accessToken: string): Promise<SheetRepairResult> {
+  return inspectWorkbookErrors(spreadsheetId, accessToken);
 }
 
 // 10. Run complete Bidirectional Synchronization & Health Test (App <-> Sheet)
@@ -2276,6 +1414,7 @@ export async function runBidirectionalSyncTest(
     updateStep(3, 'running', `Deleting test row and auditing sheet formulas for #REF! errors...`);
     await deleteReservationFromSheet(spreadsheetId, sheetName, testBookingId, accessToken);
     const repairResult = await fixSheetRefErrors(spreadsheetId, sheetName, accessToken);
+    if (repairResult.remainingErrors > 0) throw new Error(repairResult.message);
     const s4Dur = Date.now() - s4Start;
     updateStep(
       3,

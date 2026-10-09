@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { User, onAuthStateChanged } from 'firebase/auth';
 import {
   initAuth,
@@ -660,12 +660,17 @@ export default function App() {
   };
 
   // Pull data from Google Sheet with automatic Guest ID backfill & bidirectional sync
+  const bookingMutationVersion = useRef(0);
+  const bookingMutationActive = useRef(false);
+
   const syncFromGoogleSheet = async (
     sheetId = selectedSheetId,
     tabName = selectedTabName,
     _activeAccessToken?: string | null,
     isQuiet = false
   ) => {
+    if (bookingMutationActive.current) return;
+    const startedAtVersion = bookingMutationVersion.current;
     if (!sheetId) {
       if (!isQuiet) triggerToast('Please select a spreadsheet to synchronize.', 'info');
       return;
@@ -692,8 +697,9 @@ export default function App() {
     }
 
     try {
-      const range = formatA1Range(tabName, 'A1:Z500');
+      const range = formatA1Range(tabName);
       const rows = await readSheetRows(sheetId, range, currentToken);
+      if (bookingMutationActive.current || startedAtVersion !== bookingMutationVersion.current) return;
 
       // Detect and backfill any missing Guest IDs in Google Sheet automatically
       const missingGuestIdRows = detectMissingGuestIdsInRows(rows);
@@ -709,16 +715,7 @@ export default function App() {
         }
       }
 
-      // Check for any #REF! errors in sheet and heal them in background
-      try {
-        const repairResult = await fixSheetRefErrors(sheetId, tabName, currentToken);
-        if (repairResult.fixedCount > 0 && !isQuiet) {
-          triggerToast(`Healed ${repairResult.fixedCount} #REF! errors in Google Sheet!`, 'info');
-        }
-      } catch (refErr) {
-        // Non-blocking background healing check
-      }
-
+      if (bookingMutationActive.current || startedAtVersion !== bookingMutationVersion.current) return;
       const parsed = parseSheetToReservations(rows);
 
       // Check if rows contains a valid header row
@@ -795,7 +792,7 @@ export default function App() {
 
   // Background Auto-Sync Timer
   useEffect(() => {
-    if (autoSyncInterval === 'off' || !token || !selectedSheetId) return;
+    if (autoSyncInterval === 'off' || !token || !selectedSheetId || isBatchProcessing) return;
 
     const intervalSeconds = parseInt(autoSyncInterval, 10) || 30;
     setAutoSyncSecondsLeft(intervalSeconds);
@@ -811,7 +808,7 @@ export default function App() {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [autoSyncInterval, token, selectedSheetId, selectedTabName]);
+  }, [autoSyncInterval, token, selectedSheetId, selectedTabName, isBatchProcessing]);
 
   // Handler to configure Google Sheet Automations via API
   const handleConfigureAutomations = async () => {
@@ -858,19 +855,7 @@ export default function App() {
       const result = await fixSheetRefErrors(sheetId, tabName, currentToken);
       setSheetRepairStats(result);
 
-      if (result.fixedCount > 0) {
-        triggerToast(`✅ ${result.message}`, 'success');
-        recordChange(
-          'sync',
-          'Repaired Sheet #REF! Errors',
-          result.message,
-          undefined,
-          undefined,
-          `Repaired ${result.fixedCount} errors`
-        );
-      } else {
-        triggerToast(`✅ Sheet tab "${tabName}" is healthy: zero #REF! errors found!`, 'success');
-      }
+      triggerToast(result.message, result.remainingErrors > 0 ? 'error' : 'success');
 
       // Re-sync after repair
       await syncFromGoogleSheet(sheetId, tabName, currentToken, true);
@@ -1263,51 +1248,56 @@ export default function App() {
     triggerToast(`Collected balance for ${b.guestName}. Marked fully paid!`, 'success');
   };
 
-  // Delete booking with explicit confirmation
+  // Complete connected writes before reporting success or removing local records.
+  const clearConnectedBookings = async (ids: string[], all = false) => {
+    if (bookingMutationActive.current) throw new Error('Another booking deletion is still running.');
+    bookingMutationActive.current = true;
+    bookingMutationVersion.current++;
+    try {
+    const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+    const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Bookings';
+    if (activeSheetId) {
+      const currentToken = await getAccessToken();
+      if (!currentToken) throw new Error('Sign in to Google before deleting connected bookings.');
+      if (all) await clearAllBookingsFromSheet(activeSheetId, activeTab, currentToken);
+      else await deleteBatchReservationsFromSheet(activeSheetId, activeTab, ids, currentToken);
+    }
+    try {
+      if (all) await clearAllReservationsFromFirestore();
+      else for (const id of ids) await deleteReservationFromFirestore(id);
+    } catch (error: any) {
+      throw new Error((activeSheetId ? 'Spreadsheet rows were cleared, but ' : '') +
+        'Firebase deletion failed. Retry to finish synchronizing: ' + (error.message || 'Unknown error'));
+    }
+    } finally {
+      bookingMutationVersion.current++;
+      bookingMutationActive.current = false;
+    }
+  };
+
   const handleDeleteBooking = (bookingId: string) => {
     const booking = reservations.find(r => r.id === bookingId);
     if (!booking) return;
-
     setConfirmModal({
-      isOpen: true,
-      title: 'Delete Reservation',
-      message: `Are you sure you want to permanently delete booking ${bookingId} (${booking.guestName})? This will remove the booking from your system and synchronize with Google Sheets.`,
+      isOpen: true, title: 'Delete Reservation',
+      message: `Delete booking ${bookingId} (${booking.guestName}) and clear its spreadsheet row?`,
       onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
-        setIsBookingModalOpen(false);
-        const snapshotBefore = [...reservations];
-        pushUndo(`Deleted booking ${bookingId} (${booking.guestName})`, snapshotBefore);
-        recordChange(
-          'delete',
-          `Reservation Deleted: ${bookingId}`,
-          `Removed reservation for ${booking.guestName} (${booking.room} • ${booking.bedCode}).`,
-          bookingId,
-          booking.guestName,
-          `Deleted ${bookingId}`,
-          snapshotBefore
-        );
-        setReservations(prev => prev.filter(r => r.id !== bookingId));
-        triggerToast(`Deleted ${bookingId}! Syncing with Google Sheets...`, 'info');
-
-        // Direct Google Sheets sync
-        const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
-        const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Booking overview';
-        const currentToken = await getAccessToken();
-        if (currentToken && activeSheetId) {
-          try {
-            await deleteReservationFromSheet(activeSheetId, activeTab, bookingId, currentToken);
-            triggerToast(`Removed ${bookingId} from Google Sheet tab "${activeTab}"!`, 'success');
-          } catch (shErr: any) {
-            console.warn('Google Sheet delete warning:', shErr);
-          }
-        }
-
-        // Direct Firebase Firestore sync
+        setIsBatchProcessing(true);
         try {
-          await deleteReservationFromFirestore(bookingId);
-        } catch (fsErr) {
-          console.warn('Firestore delete note:', fsErr);
-        }
+          const snapshotBefore = [...reservations];
+          await clearConnectedBookings([bookingId]);
+          pushUndo(`Deleted booking ${bookingId}`, snapshotBefore);
+          recordChange('delete', `Reservation Deleted: ${bookingId}`, 'Booking data cleared; spreadsheet rows and formulas retained.',
+            bookingId, booking.guestName, `Deleted ${bookingId}`, snapshotBefore);
+          setReservations(prev => prev.filter(r => r.id !== bookingId));
+          setIsBookingModalOpen(false);
+          triggerToast(`Deleted ${bookingId} and synchronized connected stores.`, 'success');
+        } catch (error: any) {
+          setSyncStatus('error');
+          setSyncMessage(error.message);
+          triggerToast(`Deletion incomplete: ${error.message}`, 'error');
+        } finally { setIsBatchProcessing(false); }
       }
     });
   };
@@ -1598,130 +1588,52 @@ export default function App() {
     }
   };
 
-  // Batch action: Delete selected bookings with confirmation
   const handleBatchDelete = () => {
-    if (selectedBookingIds.length === 0) return;
-    const count = selectedBookingIds.length;
+    if (!selectedBookingIds.length) return;
+    const ids = [...selectedBookingIds];
     setConfirmModal({
-      isOpen: true,
-      title: `Delete ${count} Selected Reservations`,
-      message: `Are you sure you want to permanently delete ${count} selected bookings (${selectedBookingIds.slice(0, 4).join(', ')}${count > 4 ? ` + ${count - 4} more` : ''})? This will remove them from the application and synchronize deletions with Google Sheets & Firebase.`,
+      isOpen: true, title: `Delete ${ids.length} Selected Reservations`,
+      message: `Delete these ${ids.length} bookings and clear their spreadsheet rows?`,
       onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         setIsBatchProcessing(true);
         try {
-          const idsToDelete = [...selectedBookingIds];
           const snapshotBefore = [...reservations];
-          pushUndo(`Batch deleted ${count} bookings`, snapshotBefore);
-          recordChange(
-            'delete',
-            `Batch Deleted: ${count} Bookings`,
-            `Permanently deleted ${count} bookings (${idsToDelete.join(', ')}).`,
-            undefined,
-            undefined,
-            `Deleted ${count} bookings`,
-            snapshotBefore
-          );
-          setReservations(prev => prev.filter(r => !idsToDelete.includes(r.id)));
+          await clearConnectedBookings(ids);
+          pushUndo(`Batch deleted ${ids.length} bookings`, snapshotBefore);
+          recordChange('delete', `Batch Deleted: ${ids.length} Bookings`, 'Cleared selected booking data in connected stores.',
+            undefined, undefined, `Deleted ${ids.length} bookings`, snapshotBefore);
+          setReservations(prev => prev.filter(r => !ids.includes(r.id)));
           setSelectedBookingIds([]);
-          triggerToast(`Deleted ${count} bookings. Syncing with Google Sheets & Firebase...`, 'info');
-
-          // 1. Direct Google Sheets batch deletion
-          const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
-          const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Booking overview';
-          const currentToken = await getAccessToken();
-          if (currentToken && activeSheetId) {
-            try {
-              await deleteBatchReservationsFromSheet(activeSheetId, activeTab, idsToDelete, currentToken);
-              triggerToast(`Removed ${count} reservations from Google Sheet!`, 'success');
-            } catch (shErr: any) {
-              console.warn('Google Sheet batch delete warning:', shErr);
-            }
-          }
-
-          // 2. Direct Firestore deletion
-          for (const id of idsToDelete) {
-            try {
-              await deleteReservationFromFirestore(id);
-            } catch (fsErr) {
-              console.warn('Firestore batch delete note:', fsErr);
-            }
-          }
-          triggerToast(`Batch deletion complete (${count} records).`, 'info');
-        } catch (err: any) {
-          triggerToast(`Batch delete failed: ${err.message}`, 'error');
-        } finally {
-          setIsBatchProcessing(false);
-        }
+          triggerToast(`Deleted and synchronized ${ids.length} bookings.`, 'success');
+        } catch (error: any) {
+          setSyncStatus('error'); setSyncMessage(error.message);
+          triggerToast(`Batch deletion incomplete: ${error.message}`, 'error');
+        } finally { setIsBatchProcessing(false); }
       }
     });
   };
 
-  // Fresh Start: Completely remove all booking records from both the App, Firebase, and Google Sheet
   const handleFreshStartWipeAll = () => {
     setConfirmModal({
-      isOpen: true,
-      title: 'Fresh Start: Remove All Booking Records',
-      message: 'Are you sure you want to completely remove ALL booking records from both the APP and the Google Sheet? This will delete all local bookings, clear all documents in Firebase Firestore, remove all booking rows from your connected Google Sheet (keeping headers and clean sheet layout intact), and heal all formulas. You will have a clean, fresh start.',
+      isOpen: true, title: 'Fresh Start: Remove All Booking Records',
+      message: 'Remove all booking records from the app, Firebase and the connected booking tab? Spreadsheet rows, formatting and calculation formulas will remain.',
       onConfirm: async () => {
         setConfirmModal(prev => ({ ...prev, isOpen: false }));
         setIsBatchProcessing(true);
         try {
           const snapshotBefore = [...reservations];
-          pushUndo(`Fresh start (Wiped ${reservations.length} bookings)`, snapshotBefore);
-
-          // 1. Wipe local state & localStorage
-          setReservations([]);
-          setSelectedBookingIds([]);
+          await clearConnectedBookings([], true);
+          pushUndo(`Fresh start (${snapshotBefore.length} bookings)`, snapshotBefore);
+          setReservations([]); setSelectedBookingIds([]);
           localStorage.setItem('muh_reservations_db', '[]');
-          triggerToast('Cleaning all bookings across App, Firebase, and Google Sheet...', 'info');
-
-          // 2. Clear all bookings from Firebase Firestore
-          try {
-            await clearAllReservationsFromFirestore();
-          } catch (fbErr: any) {
-            console.warn('Firestore clear all note:', fbErr);
-          }
-
-          // 3. Clear all bookings from connected Google Sheet
-          const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
-          const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Booking overview';
-          const currentToken = await getAccessToken();
-
-          let sheetRowsDeleted = 0;
-          if (currentToken && activeSheetId) {
-            try {
-              const res = await clearAllBookingsFromSheet(activeSheetId, activeTab, currentToken);
-              sheetRowsDeleted = res.deletedCount;
-              // Run fixSheetRefErrors to verify 100% clean sheet with zero #REF! errors
-              await fixSheetRefErrors(activeSheetId, activeTab, currentToken);
-            } catch (shErr: any) {
-              console.warn('Google Sheet clear all error:', shErr);
-              triggerToast(`Google Sheet note: ${shErr.message || 'Could not clear sheet rows'}`, 'info');
-            }
-          }
-
-          recordChange(
-            'delete',
-            'Fresh Start: All Bookings Cleared',
-            `Removed all booking records from App and Google Sheet (${sheetRowsDeleted} sheet rows removed). Clean slate established.`,
-            undefined,
-            undefined,
-            'Fresh start: 0 bookings',
-            snapshotBefore
-          );
-
-          triggerToast(
-            currentToken && activeSheetId
-              ? `Fresh start complete! Removed all bookings from App and ${sheetRowsDeleted} rows from Google Sheet.`
-              : `Fresh start complete! All bookings removed from App & database.`,
-            'success'
-          );
-        } catch (err: any) {
-          triggerToast(`Fresh start failed: ${err.message}`, 'error');
-        } finally {
-          setIsBatchProcessing(false);
-        }
+          recordChange('delete', 'Fresh Start: All Bookings Cleared', 'Connected booking records cleared; worksheet structure preserved.',
+            undefined, undefined, 'Fresh start: 0 bookings', snapshotBefore);
+          triggerToast('All booking records cleared from connected stores.', 'success');
+        } catch (error: any) {
+          setSyncStatus('error'); setSyncMessage(error.message);
+          triggerToast(`Fresh start incomplete: ${error.message}`, 'error');
+        } finally { setIsBatchProcessing(false); }
       }
     });
   };
@@ -2613,10 +2525,10 @@ export default function App() {
                 onClick={handleRepairSheetRefErrors}
                 disabled={isFixingRefErrors}
                 className="hidden xl:flex items-center space-x-1.5 px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-900 border border-rose-200 rounded-xl text-xs font-semibold transition cursor-pointer disabled:opacity-50"
-                title="Scan and repair #REF! errors and broken formulas in Google Sheet"
+                title="Check all workbook tabs for formula errors"
               >
                 <Wrench className={`w-3.5 h-3.5 text-rose-600 ${isFixingRefErrors ? 'animate-spin' : ''}`} />
-                <span>Fix #REF!</span>
+                <span>Check formulas</span>
               </button>
             )}
 
@@ -4677,10 +4589,10 @@ export default function App() {
                           onClick={handleRepairSheetRefErrors}
                           disabled={isFixingRefErrors || !selectedSheetId}
                           className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-900 border border-rose-200 font-bold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer disabled:opacity-50"
-                          title="Audit formulas and fix #REF! errors"
+                          title="Check all workbook tabs for formula errors"
                         >
                           <Wrench className={`w-3.5 h-3.5 text-rose-600 ${isFixingRefErrors ? 'animate-spin' : ''}`} />
-                          <span>Fix #REF! Errors</span>
+                          <span>Check formulas</span>
                         </button>
 
                         <button
@@ -5945,10 +5857,10 @@ export default function App() {
                   onClick={handleRepairSheetRefErrors}
                   disabled={isFixingRefErrors}
                   className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-900 border border-rose-200 rounded-xl text-xs font-semibold transition cursor-pointer flex items-center space-x-1.5 disabled:opacity-50"
-                  title="Scan sheet and fix any #REF! errors immediately"
+                  title="Check all workbook tabs without changing records"
                 >
                   <Wrench className={`w-3.5 h-3.5 text-rose-600 ${isFixingRefErrors ? 'animate-spin' : ''}`} />
-                  <span>Fix #REF! Errors</span>
+                  <span>Check formulas</span>
                 </button>
                 <button
                   type="button"
@@ -5992,7 +5904,7 @@ export default function App() {
                 {
                   step: 4,
                   title: 'Clean Row Deletion & #REF! Error Protection',
-                  description: 'Deletes test row from Google Sheet and audits all formulas for zero #REF! errors.',
+                  description: 'Clears the test booking while preserving rows and formulas, then checks every workbook tab.',
                 },
               ].map(item => {
                 const stepResult =
