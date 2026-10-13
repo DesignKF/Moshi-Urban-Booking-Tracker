@@ -52,6 +52,15 @@ import {
   ChangeLogEntry
 } from './types';
 import {
+  formatDateKey,
+  parseDateKey,
+  calculateInventory,
+  calculateDateAvailability,
+  generateMonthGrid,
+  formatReadableHeading,
+  deriveSyncStatus
+} from './calendarUxLogic.mjs';
+import {
   Calendar,
   Bed,
   Users,
@@ -113,6 +122,7 @@ import {
   Clock,
   CalendarDays,
   Edit3,
+  Eye,
   Wrench,
   PlayCircle,
   Activity
@@ -355,6 +365,44 @@ export default function App() {
   const [calendarView, setCalendarView] = useState<'month' | 'day' | 'timeline'>('month');
   const [currentCalendarDate, setCurrentCalendarDate] = useState<Date>(new Date());
   const [timelineAnchor, setTimelineAnchor] = useState<Date>(new Date());
+  const [selectedCalendarDate, setSelectedCalendarDate] = useState<string>(() => {
+    const now = new Date();
+    return formatDateKey(now.getFullYear(), now.getMonth(), now.getDate());
+  });
+
+  // Synchronization status state (grounded in actual application events and server responses)
+  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
+  const [inFlightSaves, setInFlightSaves] = useState<number>(0);
+  const [inFlightRefreshes, setInFlightRefreshes] = useState<number>(0);
+  const [isOffline, setIsOffline] = useState<boolean>(() => typeof navigator !== 'undefined' ? !navigator.onLine : false);
+  const [lastSuccessfulRefreshTime, setLastSuccessfulRefreshTime] = useState<string | null>(null);
+  const [saveSucceededRefreshFailed, setSaveSucceededRefreshFailed] = useState<boolean>(false);
+  const [syncError, setSyncError] = useState<{ type: 'save' | 'refresh' | 'auth' | 'network'; message: string } | null>(null);
+  const [justSaved, setJustSaved] = useState<boolean>(false);
+  const [showSyncDetails, setShowSyncDetails] = useState<boolean>(false);
+
+  // Derived synchronization status from actual application events and server confirmations
+  const currentSyncInfo = useMemo(() => {
+    return deriveSyncStatus({
+      isInitialLoading,
+      inFlightSaves,
+      inFlightRefreshes,
+      isOffline,
+      lastSuccessfulRefreshTime,
+      saveSucceededRefreshFailed,
+      lastError: syncError,
+      justSaved
+    });
+  }, [
+    isInitialLoading,
+    inFlightSaves,
+    inFlightRefreshes,
+    isOffline,
+    lastSuccessfulRefreshTime,
+    saveSucceededRefreshFailed,
+    syncError,
+    justSaved
+  ]);
 
   // Modals
   const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
@@ -502,20 +550,14 @@ export default function App() {
     testFirestoreConnection().then(connected => {
       setFirestoreConnected(connected);
       if (connected) {
-        // If initial clean-slate boot, purge old leftover mock docs from Firestore
-        if (!localStorage.getItem('muh_firestore_cleaned_v1')) {
-          localStorage.setItem('muh_firestore_cleaned_v1', 'true');
-          clearAllReservationsFromFirestore().catch(() => {});
-        } else {
-          // Try initial pull from Firestore
-          fetchReservationsFromFirestore().then(list => {
-            if (list) {
-              setReservations(list);
-            }
-          }).catch(err => {
-            console.warn('Initial Firestore fetch note:', err);
-          });
-        }
+        // Try initial pull from Firestore
+        fetchReservationsFromFirestore().then(list => {
+          if (list && list.length > 0) {
+            setReservations(list);
+          }
+        }).catch(err => {
+          console.warn('Initial Firestore fetch note:', err);
+        });
 
         // Set up real-time onSnapshot listener
         const unsub = subscribeToReservations(
@@ -737,6 +779,7 @@ export default function App() {
       return;
     }
 
+    setInFlightRefreshes(prev => prev + 1);
     if (!isQuiet) {
       setIsSyncing(true);
       setSyncStatus('syncing');
@@ -775,6 +818,13 @@ export default function App() {
         }
       }
 
+      const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setLastSyncTime(now);
+      setLastSuccessfulRefreshTime(now);
+      setSyncError(null);
+      setSaveSucceededRefreshFailed(false);
+      setIsInitialLoading(false);
+
       if (parsed.length > 0) {
         setReservations(parsed);
         // Sync records to Firestore
@@ -783,8 +833,6 @@ export default function App() {
         }
 
         setSyncStatus('success');
-        const now = new Date().toLocaleTimeString();
-        setLastSyncTime(now);
         setSyncMessage(`Synchronized ${parsed.length} reservations with Google Sheet at ${now}`);
         if (!isQuiet) {
           triggerToast(`Successfully synced ${parsed.length} reservations from Google Sheets!`, 'success');
@@ -795,8 +843,6 @@ export default function App() {
           setReservations([]);
         }
         setSyncStatus('success');
-        const now = new Date().toLocaleTimeString();
-        setLastSyncTime(now);
         setSyncMessage(`Connected to Google Sheet. Tab "${tabName}" has 0 active bookings at ${now}.`);
         if (!isQuiet) {
           triggerToast(`Sheet connected! Tab "${tabName}" has 0 active bookings.`, 'info');
@@ -814,6 +860,7 @@ export default function App() {
         setToken(null);
         setSyncStatus('idle');
         setSyncMessage('Google authorization expired. Please click "Sign in with Google" to refresh permissions.');
+        setSyncError({ type: 'auth', message: 'Google authorization expired. Sign in to reconnect Google Sheets.' });
         if (!isQuiet) {
           triggerToast('Google authorization expired. Please click "Sign in with Google" to refresh permissions.', 'error');
         }
@@ -826,11 +873,13 @@ export default function App() {
 
         setSyncStatus('error');
         setSyncMessage(friendlyMsg);
+        setSyncError({ type: 'refresh', message: friendlyMsg });
         if (!isQuiet) {
           triggerToast(`Sync failed: ${friendlyMsg}`, 'error');
         }
       }
     } finally {
+      setInFlightRefreshes(prev => Math.max(0, prev - 1));
       if (!isQuiet) {
         setIsSyncing(false);
       }
@@ -973,6 +1022,12 @@ export default function App() {
 
   // Push new/updated reservation to Google Sheet with User Confirmation
   const saveReservationToSheet = async (resData: Reservation, isNew: boolean) => {
+    if (isOffline || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+      triggerToast('Cannot save while offline. Displayed data is cached. Please reconnect to save.', 'error');
+      setSyncError({ type: 'network', message: 'Offline: saving is not supported while disconnected.' });
+      throw new Error('Offline: saving to Google Sheets is not supported while disconnected.');
+    }
+
     const currentToken = await getAccessToken();
     const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id') || '';
     const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Booking overview';
@@ -983,9 +1038,12 @@ export default function App() {
         `Saved ${resData.id} to local app. Connect Google Sheets under "Spreadsheet Database" to synchronize automatically.`,
         'info'
       );
+      setJustSaved(true);
+      setTimeout(() => setJustSaved(false), 3000);
       return;
     }
 
+    setInFlightSaves(prev => prev + 1);
     setIsSyncing(true);
     try {
       if (isNew) {
@@ -995,12 +1053,25 @@ export default function App() {
         await updateReservationInSheet(activeSheetId, activeTab, resData, currentToken);
         triggerToast(`Updated ${resData.id} in Google Sheet tab "${activeTab}"!`, 'success');
       }
-      setLastSyncTime(new Date().toLocaleTimeString());
+      const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      setLastSyncTime(now);
+      setLastSuccessfulRefreshTime(now);
       setSyncStatus('success');
+      setJustSaved(true);
+      setTimeout(() => setJustSaved(false), 3500);
+      setSyncError(null);
+      setSaveSucceededRefreshFailed(false);
     } catch (err: any) {
       console.error('Error saving to sheet:', err);
+      const isAuth = err.message?.toLowerCase().includes('expired') || err.message?.includes('401') || err.message?.includes('unauthorized');
+      setSyncError({
+        type: isAuth ? 'auth' : 'save',
+        message: err.message || 'Error saving to Google Sheets'
+      });
       triggerToast(`Saved locally, but Google Sheets update failed: ${err.message}`, 'error');
+      throw err;
     } finally {
+      setInFlightSaves(prev => Math.max(0, prev - 1));
       setIsSyncing(false);
     }
   };
@@ -1162,37 +1233,43 @@ export default function App() {
       currency: formData.currency as 'TZS' | 'USD'
     };
 
-    // Close booking modal immediately and update local state
-    setIsBookingModalOpen(false);
-
-    const snapshotBefore = [...reservations];
-    pushUndo(isNew ? `Created booking ${finalRecord.id}` : `Updated booking ${finalRecord.id}`, snapshotBefore);
-    recordChange(
-      isNew ? 'create' : 'update',
-      isNew ? `New Booking: ${finalRecord.id} (${finalRecord.guestName})` : `Booking Updated: ${finalRecord.id} (${finalRecord.guestName})`,
-      `${finalRecord.room} (${finalRecord.bedCode}) • ${finalRecord.checkIn} to ${finalRecord.checkOut} • Total $${finalRecord.totalAmount}`,
-      finalRecord.id,
-      finalRecord.guestName,
-      isNew ? `Created reservation ${finalRecord.id}` : `Updated status to "${finalRecord.status}"`,
-      snapshotBefore
-    );
-
-    if (isNew) {
-      setReservations(prev => [finalRecord, ...prev]);
-      triggerToast(`Saved ${finalRecord.id} for ${finalRecord.guestName}! Syncing with Google Sheets...`, 'info');
-    } else {
-      setReservations(prev => prev.map(item => (item.id === finalRecord.id ? finalRecord : item)));
-      triggerToast(`Updated ${finalRecord.id}! Syncing with Google Sheets...`, 'info');
-    }
-
-    // Direct Google Sheets API sync
-    await saveReservationToSheet(finalRecord, isNew);
-
-    // Direct Firebase Firestore sync
+    // Attempt server write BEFORE closing form modal to preserve unsaved inputs upon failure:
     try {
-      await saveReservationToFirestore(finalRecord);
-    } catch (fsErr) {
-      console.warn('Firestore reservation sync note:', fsErr);
+      await saveReservationToSheet(finalRecord, isNew);
+      try {
+        await saveReservationToFirestore(finalRecord);
+      } catch (fsErr) {
+        console.warn('Firestore reservation sync note:', fsErr);
+      }
+
+      // Close booking modal and update local state upon confirmed success
+      setIsBookingModalOpen(false);
+      setEditingBooking(null);
+
+      const snapshotBefore = [...reservations];
+      pushUndo(isNew ? `Created booking ${finalRecord.id}` : `Updated booking ${finalRecord.id}`, snapshotBefore);
+      recordChange(
+        isNew ? 'create' : 'update',
+        isNew ? `New Booking: ${finalRecord.id} (${finalRecord.guestName})` : `Booking Updated: ${finalRecord.id} (${finalRecord.guestName})`,
+        `${finalRecord.room} (${finalRecord.bedCode}) • ${finalRecord.checkIn} to ${finalRecord.checkOut} • Total $${finalRecord.totalAmount}`,
+        finalRecord.id,
+        finalRecord.guestName,
+        isNew ? `Created reservation ${finalRecord.id}` : `Updated status to "${finalRecord.status}"`,
+        snapshotBefore
+      );
+
+      if (isNew) {
+        setReservations(prev => [finalRecord, ...prev]);
+        triggerToast(`Saved ${finalRecord.id} for ${finalRecord.guestName}!`, 'success');
+      } else {
+        setReservations(prev => prev.map(item => (item.id === finalRecord.id ? finalRecord : item)));
+        triggerToast(`Updated ${finalRecord.id}!`, 'success');
+      }
+    } catch (saveErr: any) {
+      // Preserve unsaved form input: modal stays open, ID preserved for idempotent retry
+      console.warn('Save failed, preserving unsaved form inputs:', saveErr.message);
+      setFormData(prev => ({ ...prev, id: finalRecord.id }));
+      triggerToast(`Could not save booking: ${saveErr.message}. Your form details are preserved for retry.`, 'error');
     }
   };
 
@@ -1988,100 +2065,25 @@ export default function App() {
     const today = new Date();
     setCurrentCalendarDate(today);
     setTimelineAnchor(today);
+    setSelectedCalendarDate(formatDateKey(today.getFullYear(), today.getMonth(), today.getDate()));
   };
 
-  // Monthly Calendar Matrix Generation (35 or 42 grid cells)
+  const realTodayStr = useMemo(() => {
+    const now = new Date();
+    return formatDateKey(now.getFullYear(), now.getMonth(), now.getDate());
+  }, []);
+
+  // Monthly Calendar Matrix Generation (dynamic inventory, proper occupied night rules)
   const monthCalendarData = useMemo(() => {
     const year = currentCalendarDate.getFullYear();
     const month = currentCalendarDate.getMonth();
-    const firstDayIndex = new Date(year, month, 1).getDay(); // 0 = Sun
-    const daysInMonth = new Date(year, month + 1, 0).getDate();
-    const daysInPrevMonth = new Date(year, month, 0).getDate();
+    return generateMonthGrid(year, month, reservations, HOSTEL_ROOMS, realTodayStr).cells;
+  }, [currentCalendarDate, reservations, realTodayStr]);
 
-    const cells: {
-      dateStr: string;
-      dayNumber: number;
-      isCurrentMonth: boolean;
-      isToday: boolean;
-      activeBookings: Reservation[];
-      arrivals: Reservation[];
-      departures: Reservation[];
-      occupiedBedsCount: number;
-    }[] = [];
-
-    const realTodayStr = new Date().toISOString().split('T')[0];
-
-    // Previous month trailing days
-    for (let i = firstDayIndex - 1; i >= 0; i--) {
-      const dayNum = daysInPrevMonth - i;
-      const prevDate = new Date(year, month - 1, dayNum);
-      const dateStr = prevDate.toISOString().split('T')[0];
-      const activeBookings = reservations.filter(
-        r => r.status !== 'Cancelled' && dateStr >= r.checkIn && dateStr < r.checkOut
-      );
-      const arrivals = reservations.filter(r => r.status !== 'Cancelled' && r.checkIn === dateStr);
-      const departures = reservations.filter(r => r.status !== 'Cancelled' && r.checkOut === dateStr);
-      const occupiedBedsCount = activeBookings.reduce((sum, r) => sum + (r.bedsCount || 1), 0);
-      cells.push({
-        dateStr,
-        dayNumber: dayNum,
-        isCurrentMonth: false,
-        isToday: dateStr === realTodayStr,
-        activeBookings,
-        arrivals,
-        departures,
-        occupiedBedsCount
-      });
-    }
-
-    // Current month days
-    for (let d = 1; d <= daysInMonth; d++) {
-      const curDate = new Date(year, month, d);
-      const dateStr = curDate.toISOString().split('T')[0];
-      const activeBookings = reservations.filter(
-        r => r.status !== 'Cancelled' && dateStr >= r.checkIn && dateStr < r.checkOut
-      );
-      const arrivals = reservations.filter(r => r.status !== 'Cancelled' && r.checkIn === dateStr);
-      const departures = reservations.filter(r => r.status !== 'Cancelled' && r.checkOut === dateStr);
-      const occupiedBedsCount = activeBookings.reduce((sum, r) => sum + (r.bedsCount || 1), 0);
-      cells.push({
-        dateStr,
-        dayNumber: d,
-        isCurrentMonth: true,
-        isToday: dateStr === realTodayStr,
-        activeBookings,
-        arrivals,
-        departures,
-        occupiedBedsCount
-      });
-    }
-
-    // Next month leading days (fill up to 35 or 42 grid cells)
-    const targetLength = cells.length > 35 ? 42 : 35;
-    const remaining = targetLength - cells.length;
-    for (let d = 1; d <= remaining; d++) {
-      const nextDate = new Date(year, month + 1, d);
-      const dateStr = nextDate.toISOString().split('T')[0];
-      const activeBookings = reservations.filter(
-        r => r.status !== 'Cancelled' && dateStr >= r.checkIn && dateStr < r.checkOut
-      );
-      const arrivals = reservations.filter(r => r.status !== 'Cancelled' && r.checkIn === dateStr);
-      const departures = reservations.filter(r => r.status !== 'Cancelled' && r.checkOut === dateStr);
-      const occupiedBedsCount = activeBookings.reduce((sum, r) => sum + (r.bedsCount || 1), 0);
-      cells.push({
-        dateStr,
-        dayNumber: d,
-        isCurrentMonth: false,
-        isToday: dateStr === realTodayStr,
-        activeBookings,
-        arrivals,
-        departures,
-        occupiedBedsCount
-      });
-    }
-
-    return cells;
-  }, [currentCalendarDate, reservations]);
+  // Comprehensive availability breakdown for the currently selected date
+  const selectedDateAvailability = useMemo(() => {
+    return calculateDateAvailability(selectedCalendarDate, reservations, HOSTEL_ROOMS);
+  }, [selectedCalendarDate, reservations]);
 
   // Day View Computations for currently selected date
   const selectedDayStr = currentCalendarDate.toISOString().split('T')[0];
@@ -2671,7 +2673,7 @@ export default function App() {
         </header>
 
         {/* Content Panes */}
-        <main className="flex-1 p-6 max-w-7xl w-full mx-auto space-y-6">
+        <main className="flex-1 p-3 sm:p-4 md:p-6 max-w-7xl w-full mx-auto space-y-4 sm:space-y-6 min-w-0">
 
           {/* ======================================================== */}
           {/* TAB 1: OVERVIEW                                          */}
@@ -3822,17 +3824,104 @@ export default function App() {
           {activeTab === 'availability' && (
             <div className="space-y-5 animate-in fade-in duration-150">
               
-              {/* Header: Title, View Switcher & Date Navigation */}
+              {/* Header: Title, Live Sync Status, View Switcher & Date Navigation */}
               <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-white p-4 sm:p-5 rounded-2xl border border-[#e8e4dc] shadow-2xs">
                 <div>
-                  <div className="flex items-center space-x-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">Availability Calendar</h1>
-                    <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 text-[10px] font-bold border border-amber-300">
-                      Live
+                    
+                    {/* Compact Synchronization Indicator */}
+                    <div className="relative">
+                      {/* Accessible Live Region for Synchronization Updates */}
+                      <div aria-live="polite" aria-atomic="true" className="sr-only">
+                        {`Hostel database sync: ${currentSyncInfo.label}. ${currentSyncInfo.description}`}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setShowSyncDetails(prev => !prev)}
+                        className={`inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border transition cursor-pointer shadow-2xs ${currentSyncInfo.badgeClass}`}
+                        title={`Database sync: ${currentSyncInfo.label}. Click for details.`}
+                        aria-label={`Database synchronization status: ${currentSyncInfo.label}`}
+                      >
+                        <span className={`w-2 h-2 rounded-full ${currentSyncInfo.dotClass}`} />
+                        <span>{currentSyncInfo.label}</span>
+                        <ChevronDown className="w-3 h-3 opacity-60 ml-0.5" />
+                      </button>
+
+                      {/* Sync Status Popover */}
+                      {showSyncDetails && (
+                        <div className="absolute left-0 mt-2 w-72 sm:w-80 bg-white rounded-2xl shadow-xl border border-[#e8e4dc] p-3.5 z-40 animate-in fade-in zoom-in-95 text-xs space-y-3">
+                          <div className="flex items-center justify-between pb-2 border-b border-[#f1ede4]">
+                            <div className="flex items-center space-x-2">
+                              <RefreshCw className={`w-4 h-4 ${currentSyncInfo.state === 'refreshing' || currentSyncInfo.state === 'saving' ? 'animate-spin text-amber-600' : 'text-slate-600'}`} />
+                              <span className="font-bold text-slate-800">Database Synchronization</span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setShowSyncDetails(false)}
+                              className="p-1 text-slate-400 hover:text-slate-600 rounded-md cursor-pointer"
+                              aria-label="Close sync details"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+
+                          <p className="text-slate-600 text-[11px] leading-relaxed">
+                            {currentSyncInfo.description}
+                          </p>
+
+                          <div className="space-y-1.5 text-[11px] bg-[#faf8f5] p-2.5 rounded-xl border border-[#e8e4dc]">
+                            <div className="flex items-center justify-between text-slate-500">
+                              <span>Connectivity:</span>
+                              <span className={`font-semibold ${isOffline ? 'text-amber-700' : 'text-emerald-700'}`}>
+                                {isOffline ? 'Offline (Cached)' : 'Online (Connected)'}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between text-slate-500">
+                              <span>Last Verified Sync:</span>
+                              <span className="font-mono text-slate-700">
+                                {lastSuccessfulRefreshTime || 'Initial session'}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between text-slate-500">
+                              <span>Active In-Flight Saves:</span>
+                              <span className="font-mono text-slate-700">{inFlightSaves}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-slate-500">
+                              <span>Google Sheet Database:</span>
+                              <span className="font-medium text-slate-700 truncate max-w-[130px]">{selectedTabName}</span>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setShowSyncDetails(false);
+                                if (token && selectedSheetId) {
+                                  syncFromGoogleSheet(selectedSheetId, selectedTabName, token, false);
+                                } else {
+                                  triggerToast('Connect Google Sheets under Spreadsheet Database to refresh.', 'info');
+                                }
+                              }}
+                              disabled={isOffline || inFlightRefreshes > 0}
+                              className="w-full py-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs rounded-xl shadow-2xs transition cursor-pointer flex items-center justify-center space-x-1.5 disabled:opacity-50"
+                            >
+                              <RefreshCw className={`w-3.5 h-3.5 ${inFlightRefreshes > 0 ? 'animate-spin' : ''}`} />
+                              <span>Refresh Server Data</span>
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <span className="px-2 py-0.5 rounded-full bg-[#f5f2eb] text-slate-700 text-[10px] font-bold border border-[#e8e4dc]">
+                      Beds Available
                     </span>
                   </div>
                   <p className="text-xs text-slate-500 mt-1">
-                    Front-desk booking calendar & room inventory. Switch between Monthly View, Day View, and 14-Day Matrix.
+                    Front-desk bed inventory & availability calendar. Select any date to view and manage its bookings.
                   </p>
                 </div>
 
@@ -3880,12 +3969,14 @@ export default function App() {
                       onClick={handleCalendarPrev}
                       className="p-1.5 border border-[#e8e4dc] rounded-xl hover:bg-slate-50 text-slate-600 transition cursor-pointer"
                       title={calendarView === 'month' ? 'Previous Month' : calendarView === 'day' ? 'Previous Day' : 'Previous 7 Days'}
+                      aria-label="Previous Month"
                     >
                       <ChevronLeft className="w-4 h-4" />
                     </button>
                     <button
                       onClick={handleCalendarToday}
                       className="px-3 py-1.5 text-xs bg-[#faf8f5] hover:bg-amber-50 text-slate-800 hover:text-amber-950 font-bold border border-[#e8e4dc] hover:border-amber-300 rounded-xl transition cursor-pointer"
+                      title="Jump to today's date"
                     >
                       Today
                     </button>
@@ -3893,12 +3984,13 @@ export default function App() {
                       onClick={handleCalendarNext}
                       className="p-1.5 border border-[#e8e4dc] rounded-xl hover:bg-slate-50 text-slate-600 transition cursor-pointer"
                       title={calendarView === 'month' ? 'Next Month' : calendarView === 'day' ? 'Next Day' : 'Next 7 Days'}
+                      aria-label="Next Month"
                     >
                       <ChevronRight className="w-4 h-4" />
                     </button>
                   </div>
 
-                  {/* Active Date Label & Date Picker */}
+                  {/* Active Month Label */}
                   <div className="flex items-center space-x-2 bg-[#faf8f5] border border-[#e8e4dc] px-3 py-1.5 rounded-xl text-xs font-bold text-slate-800">
                     <CalendarDays className="w-4 h-4 text-[#fdbe4e]" />
                     <span>
@@ -3908,25 +4000,13 @@ export default function App() {
                         ? currentCalendarDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
                         : `${new Date(timelineAnchor).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${new Date(new Date(timelineAnchor).setDate(timelineAnchor.getDate() + 13)).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}
                     </span>
-                    <input
-                      type="date"
-                      value={currentCalendarDate.toISOString().split('T')[0]}
-                      onChange={e => {
-                        if (e.target.value) {
-                          const picked = new Date(e.target.value + 'T00:00:00');
-                          setCurrentCalendarDate(picked);
-                          setTimelineAnchor(picked);
-                        }
-                      }}
-                      className="opacity-0 w-4 h-4 absolute cursor-pointer"
-                      title="Jump to date"
-                    />
                   </div>
 
-                  {/* Quick Action: New Reservation */}
+                  {/* Clear New Booking action in the page header */}
                   <button
-                    onClick={() => handleOpenNewModal(undefined, currentCalendarDate.toISOString().split('T')[0])}
+                    onClick={() => handleOpenNewModal(undefined, selectedCalendarDate)}
                     className="flex items-center space-x-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs px-3.5 py-2 rounded-xl shadow-xs transition cursor-pointer"
+                    title={`Create new booking for ${selectedCalendarDate}`}
                   >
                     <Plus className="w-4 h-4" />
                     <span>New Booking</span>
@@ -3936,185 +4016,382 @@ export default function App() {
 
               {/* ========================================================= */}
               {/* VIEW 1: MONTHLY CALENDAR VIEW                            */}
+              {/* Responsive Layout: Desktop 2-column (~2/3 cal, ~1/3 details) */}
+              {/* Mobile/Tablet 1-column stack (full-width cal, details below) */}
               {/* ========================================================= */}
               {calendarView === 'month' && (
-                <div className="bg-white rounded-2xl border border-[#e8e4dc] p-4 sm:p-5 shadow-2xs space-y-3">
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 sm:gap-6 items-start min-w-0">
                   
-                  {/* Month Grid Header: Days of the Week */}
-                  <div className="grid grid-cols-7 gap-2 text-center text-[11px] font-bold tracking-wider uppercase text-slate-400 pb-2 border-b border-[#f0ede6]">
-                    <span>Sun</span>
-                    <span>Mon</span>
-                    <span>Tue</span>
-                    <span>Wed</span>
-                    <span>Thu</span>
-                    <span>Fri</span>
-                    <span>Sat</span>
-                  </div>
-
-                  {/* 35 or 42 Calendar Cells */}
-                  <div className="grid grid-cols-7 gap-2">
-                    {monthCalendarData.map((cell, idx) => {
-                      const totalBeds = 16;
-                      const freeBeds = Math.max(0, totalBeds - cell.occupiedBedsCount);
-                      const isFull = cell.occupiedBedsCount >= totalBeds;
-                      const isPartiallyBooked = cell.occupiedBedsCount > 0 && !isFull;
-
-                      return (
-                        <div
-                          key={idx}
-                          className={`min-h-[110px] sm:min-h-[125px] p-2 rounded-xl border flex flex-col justify-between transition group relative ${
-                            cell.isToday
-                              ? 'bg-amber-50/70 border-amber-400 ring-2 ring-[#fdbe4e]/40 shadow-xs'
-                              : cell.isCurrentMonth
-                              ? 'bg-white border-[#e8e4dc] hover:border-amber-300 hover:shadow-xs'
-                              : 'bg-slate-50/70 border-slate-200/60 opacity-60'
-                          }`}
-                        >
-                          {/* Cell Top: Date Number & Daily Occupancy Pill */}
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center space-x-1">
-                              <span
-                                className={`text-xs font-bold font-mono ${
-                                  cell.isToday
-                                    ? 'w-6 h-6 rounded-full bg-[#fdbe4e] text-[#0d1726] flex items-center justify-center shadow-xs font-black'
-                                    : cell.isCurrentMonth
-                                    ? 'text-slate-800'
-                                    : 'text-slate-400'
-                                }`}
-                              >
-                                {cell.dayNumber}
-                              </span>
-                              {cell.isToday && (
-                                <span className="text-[9px] font-bold text-amber-800 uppercase tracking-wider hidden sm:inline">
-                                  Today
-                                </span>
-                              )}
-                            </div>
-
-                            {/* Occupancy pill indicator */}
-                            <span
-                              className={`text-[10px] font-mono px-1.5 py-0.5 rounded-md font-semibold ${
-                                isFull
-                                  ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                                  : isPartiallyBooked
-                                  ? 'bg-amber-100 text-amber-900 border border-amber-200'
-                                  : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                              }`}
-                              title={`${cell.occupiedBedsCount} of ${totalBeds} beds booked (${freeBeds} free)`}
-                            >
-                              {cell.occupiedBedsCount > 0 ? `${cell.occupiedBedsCount}/16b` : '16 free'}
-                            </span>
-                          </div>
-
-                          {/* Cell Middle: Booking Chips for Active Guests on this day */}
-                          <div className="space-y-1 my-1.5 flex-1 overflow-y-auto max-h-[75px]">
-                            {cell.activeBookings.slice(0, 3).map(b => {
-                              const isCheckedIn = b.status.toLowerCase() === 'checked-in';
-                              const isConfirmed = b.status.toLowerCase() === 'confirmed';
-                              const isCheckedOut = b.status.toLowerCase() === 'checked-out';
-
-                              return (
-                                <div
-                                  key={b.id}
-                                  onClick={e => {
-                                    e.stopPropagation();
-                                    setSelectedBookingInfo({
-                                      roomName: b.room,
-                                      dateStr: cell.dateStr,
-                                      bookings: [b]
-                                    });
-                                  }}
-                                  title={`${b.guestName} (${b.id}) • ${b.room} [${b.unitId || b.bedCode}] • ${b.status} • Click to view`}
-                                  className={`px-1.5 py-0.5 rounded text-[10px] truncate cursor-pointer transition flex items-center space-x-1 border ${
-                                    isCheckedIn
-                                      ? 'bg-blue-50 text-blue-900 border-blue-200 hover:bg-blue-100'
-                                      : isConfirmed
-                                      ? 'bg-emerald-50 text-emerald-900 border-emerald-200 hover:bg-emerald-100'
-                                      : isCheckedOut
-                                      ? 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200'
-                                      : 'bg-amber-50 text-amber-900 border-amber-200 hover:bg-amber-100'
-                                  }`}
-                                >
-                                  <span
-                                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                                      isCheckedIn ? 'bg-blue-500' : isConfirmed ? 'bg-emerald-500' : 'bg-amber-500'
-                                    }`}
-                                  />
-                                  <span className="font-semibold truncate">{b.guestName.split(' ')[0]}</span>
-                                  <span className="opacity-70 text-[9px] shrink-0 font-mono">
-                                    {b.unitId || b.bedCode}
-                                  </span>
-                                </div>
-                              );
-                            })}
-
-                            {/* Overflow indicator if > 3 bookings on that day */}
-                            {cell.activeBookings.length > 3 && (
-                              <button
-                                onClick={e => {
-                                  e.stopPropagation();
-                                  setSelectedBookingInfo({
-                                    roomName: 'All Hostel Rooms',
-                                    dateStr: cell.dateStr,
-                                    bookings: cell.activeBookings
-                                  });
-                                }}
-                                className="text-[9px] font-bold text-amber-800 hover:text-amber-950 px-1 py-0.2 rounded hover:underline cursor-pointer block w-full text-left"
-                              >
-                                + {cell.activeBookings.length - 3} more bookings...
-                              </button>
-                            )}
-                          </div>
-
-                          {/* Cell Bottom: Click to Book button on hover */}
-                          <div className="pt-1 flex items-center justify-between text-[10px]">
-                            {cell.arrivals.length > 0 ? (
-                              <span className="text-[9px] text-emerald-700 font-semibold" title={`${cell.arrivals.length} arrivals scheduled`}>
-                                ↓ {cell.arrivals.length} arr
-                              </span>
-                            ) : cell.departures.length > 0 ? (
-                              <span className="text-[9px] text-slate-500" title={`${cell.departures.length} departures scheduled`}>
-                                ↑ {cell.departures.length} dep
-                              </span>
-                            ) : <span />}
-
-                            <button
-                              onClick={() => handleOpenNewModal(undefined, cell.dateStr)}
-                              className="text-[10px] font-bold text-amber-800 hover:text-amber-950 opacity-0 group-hover:opacity-100 transition flex items-center space-x-0.5 cursor-pointer bg-white/80 px-1 rounded shadow-2xs"
-                              title={`Create booking for ${cell.dateStr}`}
-                            >
-                              <Plus className="w-2.5 h-2.5" />
-                              <span>Book</span>
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Legend */}
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-[#f1ede4] text-xs text-slate-500">
-                    <div className="flex flex-wrap items-center gap-3">
-                      <span className="flex items-center space-x-1.5">
-                        <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
-                        <span>Checked-in Guest</span>
-                      </span>
-                      <span className="flex items-center space-x-1.5">
-                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-                        <span>Confirmed Booking</span>
-                      </span>
-                      <span className="flex items-center space-x-1.5">
-                        <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
-                        <span>Tentative / Other</span>
-                      </span>
-                      <span className="flex items-center space-x-1.5">
-                        <span className="w-2.5 h-2.5 rounded-xs bg-[#fdbe4e]" />
-                        <span>Current Day (Today)</span>
+                  {/* Left Column: Simplified Monthly Calendar (~2/3 width) */}
+                  <div className="xl:col-span-7 2xl:col-span-8 bg-white rounded-2xl border border-[#e8e4dc] p-2.5 sm:p-4 shadow-2xs space-y-3 min-w-0">
+                    
+                    {/* Calendar Month Header & Context */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-[#f0ede6]">
+                      <div className="flex items-center space-x-2">
+                        <span className="font-serif font-bold text-slate-900 text-base sm:text-lg">
+                          {currentCalendarDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                        </span>
+                        <span className="text-xs text-slate-500 font-mono">
+                          • {HOSTEL_ROOMS.reduce((s, r) => s + r.capacity, 0)} total beds across {HOSTEL_ROOMS.length} rooms
+                        </span>
+                      </div>
+                      <span className="text-[11px] text-slate-500 font-medium">
+                        Beds available: each cell shows open beds on that date
                       </span>
                     </div>
 
-                    <div className="text-[11px] text-slate-400">
-                      Click any guest chip to view details • Click <strong>Book</strong> to create a stay
+                    {/* Days of the Week Header */}
+                    <div className="grid grid-cols-7 gap-1 text-center text-[11px] sm:text-xs font-bold tracking-wider uppercase text-slate-400 pb-1 min-w-0">
+                      <span>Sun</span>
+                      <span>Mon</span>
+                      <span>Tue</span>
+                      <span>Wed</span>
+                      <span>Thu</span>
+                      <span>Fri</span>
+                      <span>Sat</span>
+                    </div>
+
+                    {/* Proper Loading State: Never temporarily displays every room free */}
+                    {isInitialLoading ? (
+                      <div className="py-16 text-center space-y-3 bg-[#faf8f5] rounded-xl border border-dashed border-[#e8e4dc]">
+                        <RefreshCw className="w-8 h-8 text-amber-600 animate-spin mx-auto" />
+                        <div>
+                          <p className="text-sm font-bold text-slate-800">Loading Hostel Room Inventory & Bookings...</p>
+                          <p className="text-xs text-slate-500 mt-0.5">Calculating real-time room availability from server records.</p>
+                        </div>
+                      </div>
+                    ) : (
+                      /* 35 or 42 Simplified Calendar Cells: Vertical Stack (Date, Qty, "free") */
+                      <div className="grid grid-cols-7 gap-1 min-w-0">
+                        {monthCalendarData.map((cell) => {
+                          const isSelected = cell.dateStr === selectedCalendarDate;
+
+                          return (
+                            <button
+                              key={cell.dateStr}
+                              type="button"
+                              onClick={() => setSelectedCalendarDate(cell.dateStr)}
+                              className={`min-w-0 w-full h-[88px] sm:h-[92px] p-1.5 rounded-xl border flex flex-col items-center justify-between text-center transition cursor-pointer relative box-border focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] ${
+                                isSelected
+                                  ? 'border-slate-900 bg-amber-50/70 shadow-xs ring-1 ring-inset ring-slate-900'
+                                  : cell.isToday
+                                  ? 'border-amber-300 bg-amber-50/20 hover:border-amber-400'
+                                  : cell.isCurrentMonth
+                                  ? 'bg-white border-[#e8e4dc] hover:border-amber-300 hover:bg-amber-50/20'
+                                  : 'bg-slate-50/70 border-slate-200/60 opacity-40'
+                              }`}
+                              aria-selected={isSelected}
+                              aria-label={`${cell.dateStr}: ${cell.availableBedsCount} beds free${cell.isToday ? ', Today' : ''}`}
+                            >
+                              {/* 1. Date number at the top (15-16px) */}
+                              <div className="flex flex-col items-center justify-center pt-0.5 w-full min-w-0">
+                                <span
+                                  className={`text-[15px] sm:text-base leading-none font-semibold ${
+                                    cell.isToday
+                                      ? 'w-6 h-6 rounded-full bg-[#fdbe4e] text-[#0d1726] font-bold text-xs flex items-center justify-center shadow-2xs'
+                                      : isSelected
+                                      ? 'text-slate-950 font-bold'
+                                      : cell.isCurrentMonth
+                                      ? 'text-slate-800'
+                                      : 'text-slate-400'
+                                  }`}
+                                >
+                                  {cell.dayNumber}
+                                </span>
+                              </div>
+
+                              {/* 2. Available quantity below it (13px) */}
+                              <div className="flex flex-col items-center justify-center my-auto w-full min-w-0">
+                                <span
+                                  className={`text-[13px] font-mono font-bold leading-tight ${
+                                    cell.availableBedsCount === 0
+                                      ? 'text-rose-600'
+                                      : cell.occupiedBedsCount > 0
+                                      ? 'text-amber-800'
+                                      : cell.isCurrentMonth
+                                      ? 'text-emerald-700'
+                                      : 'text-slate-400'
+                                  }`}
+                                >
+                                  {cell.availableBedsCount}
+                                </span>
+                              </div>
+
+                              {/* 3. Small label saying "free" below the quantity (11-12px) */}
+                              <div className="flex flex-col items-center justify-center pb-0.5 w-full min-w-0">
+                                <span
+                                  className={`text-[11px] font-medium leading-none ${
+                                    cell.availableBedsCount === 0
+                                      ? 'text-rose-500 font-semibold'
+                                      : cell.isCurrentMonth
+                                      ? 'text-slate-500'
+                                      : 'text-slate-400'
+                                  }`}
+                                >
+                                  {cell.availableBedsCount === 0 ? 'full' : 'free'}
+                                </span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Mobile & Tablet Hint: Clear indication that selecting a date updates details below */}
+                    <div className="xl:hidden text-center text-xs text-slate-500 pt-2 border-t border-[#f0ede6] flex items-center justify-center space-x-1.5">
+                      <CalendarDays className="w-3.5 h-3.5 text-[#fdbe4e]" />
+                      <span>Select any date cell above to view and manage its bookings below.</span>
+                    </div>
+
+                    {/* Calendar Legend */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-[#f1ede4] text-xs text-slate-500">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="flex items-center space-x-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-[#fdbe4e] ring-1 ring-amber-400" />
+                          <span>Today indicator</span>
+                        </span>
+                        <span className="flex items-center space-x-1.5">
+                          <span className="w-2.5 h-2.5 rounded-xs border-2 border-[#0d1726] bg-amber-50" />
+                          <span>Selected date</span>
+                        </span>
+                        <span className="flex items-center space-x-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                          <span>Available (free beds)</span>
+                        </span>
+                        <span className="flex items-center space-x-1.5">
+                          <span className="w-2.5 h-2.5 rounded-full bg-rose-500" />
+                          <span>Full (0 free beds)</span>
+                        </span>
+                        <span className="flex items-center space-x-1.5">
+                          <span className="w-2.5 h-2.5 rounded-xs bg-slate-300 opacity-60" />
+                          <span>Other month (muted)</span>
+                        </span>
+                      </div>
+
+                      <div className="text-[11px] text-slate-400">
+                        Never overlaps guest names • Click cell to inspect full folio details
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right Column (Desktop) / Below Calendar (Mobile & Tablet): Selected-Date Details */}
+                  <div className="xl:col-span-5 2xl:col-span-4 bg-white rounded-2xl border border-[#e8e4dc] p-3.5 sm:p-5 shadow-2xs space-y-4 min-w-0">
+                    
+                    {/* Selected Date Header */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[#f0ede6]">
+                      <div>
+                        <div className="flex items-center space-x-2">
+                          <CalendarDays className="w-4 h-4 text-[#fdbe4e]" />
+                          <h2 className="text-base font-bold font-serif text-slate-900 tracking-tight">
+                            {formatReadableHeading(selectedCalendarDate)}
+                          </h2>
+                          {selectedCalendarDate === realTodayStr && (
+                            <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 text-[10px] font-bold border border-amber-300">
+                              Today
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          Front-desk schedule for selected date
+                        </p>
+                      </div>
+
+                      <button
+                        onClick={() => handleOpenNewModal(undefined, selectedCalendarDate)}
+                        className="flex items-center space-x-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs px-3 py-1.5 rounded-xl shadow-2xs transition cursor-pointer self-start sm:self-auto"
+                        title={`Create new booking for ${selectedCalendarDate}`}
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>New Booking</span>
+                      </button>
+                    </div>
+
+                    {/* Availability & Inventory Summary for Selected Date */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">
+                      <div className="p-2 rounded-xl bg-[#faf8f5] border border-[#e8e4dc]">
+                        <span className="text-[10px] text-slate-400 block font-medium">Beds Free</span>
+                        <span className="font-bold font-mono text-emerald-700 text-sm">
+                          {selectedDateAvailability.availableBedsCount} / {selectedDateAvailability.totalBeds}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-xl bg-[#faf8f5] border border-[#e8e4dc]">
+                        <span className="text-[10px] text-slate-400 block font-medium">Beds Booked</span>
+                        <span className="font-bold font-mono text-amber-900 text-sm">
+                          {selectedDateAvailability.occupiedBedsCount} / {selectedDateAvailability.totalBeds}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-xl bg-[#faf8f5] border border-[#e8e4dc]">
+                        <span className="text-[10px] text-slate-400 block font-medium">Rooms with Bookings</span>
+                        <span className="font-bold font-mono text-slate-800 text-sm">
+                          {selectedDateAvailability.bookedRoomsCount} / {selectedDateAvailability.totalRooms}
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-xl bg-[#faf8f5] border border-[#e8e4dc]">
+                        <span className="text-[10px] text-slate-400 block font-medium">Total Bookings</span>
+                        <span className="font-bold font-mono text-slate-800 text-sm">
+                          {selectedDateAvailability.reservationCount}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Bookings List: Scrollable container accommodates many bookings without breaking page */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between text-xs text-slate-500 font-semibold px-0.5">
+                        <span>Active Bookings on this Date ({selectedDateAvailability.activeBookings.length})</span>
+                        <span className="text-[11px] font-normal text-slate-400">
+                          {selectedDateAvailability.occupiedBedsCount} beds occupied
+                        </span>
+                      </div>
+
+                      {selectedDateAvailability.activeBookings.length === 0 ? (
+                        /* Empty State: Clear indication with action to create a booking */
+                        <div className="p-7 text-center bg-[#faf8f5] rounded-xl border border-dashed border-[#e0dad0] space-y-3">
+                          <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto" />
+                          <div>
+                            <h4 className="text-sm font-bold text-slate-800">No Bookings on this Date</h4>
+                            <p className="text-xs text-slate-500 mt-1">
+                              All {selectedDateAvailability.totalBeds} beds across {selectedDateAvailability.totalRooms} hostel rooms are open.
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenNewModal(undefined, selectedCalendarDate)}
+                            className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs rounded-xl shadow-xs transition cursor-pointer"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            <span>Book for {selectedCalendarDate}</span>
+                          </button>
+                        </div>
+                      ) : (
+                        /* Bookings cards: displays all details without truncation */
+                        <div className="max-h-[520px] xl:max-h-[calc(100vh-320px)] overflow-y-auto space-y-2.5 pr-1">
+                          {selectedDateAvailability.activeBookings.map(b => {
+                            const isCheckedIn = (b.status || '').toLowerCase() === 'checked-in';
+                            const isConfirmed = (b.status || '').toLowerCase() === 'confirmed';
+                            const isCheckedOut = (b.status || '').toLowerCase() === 'checked-out';
+
+                            return (
+                              <div
+                                key={b.id}
+                                className="p-3.5 rounded-xl border border-[#e8e4dc] bg-white hover:border-amber-300 transition shadow-2xs space-y-2.5"
+                              >
+                                <div className="flex items-start justify-between gap-2">
+                                  <div>
+                                    <div className="flex items-center space-x-2">
+                                      <h4 className="font-bold text-sm text-slate-900">{b.guestName}</h4>
+                                      <span className="text-[11px] text-slate-400 font-mono">({b.id})</span>
+                                    </div>
+                                    <p className="text-xs text-slate-600 mt-0.5">
+                                      <strong>{b.room}</strong> • Bed <span className="font-mono text-amber-900 font-semibold">{b.unitId || b.bedCode}</span>
+                                      {b.bedsCount > 1 && <span className="text-slate-400 ml-1">({b.bedsCount} beds)</span>}
+                                    </p>
+                                  </div>
+
+                                  {/* Readable Status Badge */}
+                                  <span
+                                    className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider shrink-0 border ${
+                                      isCheckedIn
+                                        ? 'bg-blue-50 text-blue-900 border-blue-200'
+                                        : isConfirmed
+                                        ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                                        : isCheckedOut
+                                        ? 'bg-slate-100 text-slate-700 border-slate-200'
+                                        : 'bg-amber-50 text-amber-900 border-amber-200'
+                                    }`}
+                                  >
+                                    {b.status}
+                                  </span>
+                                </div>
+
+                                <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-x-3 gap-y-1 bg-[#faf8f5] p-2 rounded-lg border border-[#f0ede6]">
+                                  <span>Check-in: <strong className="text-slate-700">{b.checkIn}</strong></span>
+                                  <span>Checkout: <strong className="text-slate-700">{b.checkOut}</strong></span>
+                                  <span>Stay: <strong className="text-slate-700">{b.nights} {b.nights === 1 ? 'night' : 'nights'}</strong></span>
+                                  <span>Total: <strong className="text-slate-800">{formatMoney(b.totalAmount)}</strong></span>
+                                  {b.balanceDue > 0 ? (
+                                    <span className="text-rose-700 font-semibold">Due: {formatMoney(b.balanceDue)}</span>
+                                  ) : (
+                                    <span className="text-emerald-700 font-semibold">Fully Paid</span>
+                                  )}
+                                </div>
+
+                                {/* Booking Actions */}
+                                <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-[#f2ede4]">
+                                  <div className="flex items-center space-x-1.5">
+                                    {isConfirmed && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleCheckIn(b.id)}
+                                        className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[10px] font-bold transition cursor-pointer flex items-center space-x-1"
+                                      >
+                                        <Check className="w-3 h-3" />
+                                        <span>Check In</span>
+                                      </button>
+                                    )}
+                                    {isCheckedIn && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleCheckOut(b.id)}
+                                        className="px-2.5 py-1 bg-amber-700 hover:bg-amber-800 text-white rounded-lg text-[10px] font-bold transition cursor-pointer flex items-center space-x-1"
+                                      >
+                                        <LogOut className="w-3 h-3" />
+                                        <span>Check Out</span>
+                                      </button>
+                                    )}
+                                    {b.balanceDue > 0 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setCollectModalBooking(b)}
+                                        className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-lg text-[10px] font-bold transition cursor-pointer"
+                                      >
+                                        Collect ${b.balanceDue}
+                                      </button>
+                                    )}
+                                  </div>
+
+                                  <div className="flex items-center space-x-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setSelectedBookingInfo({
+                                        roomName: b.room,
+                                        dateStr: selectedCalendarDate,
+                                        bookings: [b]
+                                      })}
+                                      className="px-2 py-1 bg-[#f5f2eb] hover:bg-[#ece8df] text-slate-700 rounded-lg text-[10px] font-bold border border-[#e8e4dc] transition cursor-pointer flex items-center space-x-1"
+                                      title="View reservation folio"
+                                      aria-label={`View folio details for ${b.guestName}`}
+                                    >
+                                      <Eye className="w-3 h-3 text-slate-500" />
+                                      <span>View</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenEditModal(b)}
+                                      className="px-2 py-1 bg-[#f5f2eb] hover:bg-[#ece8df] text-slate-800 rounded-lg text-[10px] font-bold border border-[#e8e4dc] transition cursor-pointer flex items-center space-x-1"
+                                      title="Edit reservation"
+                                      aria-label={`Edit booking ${b.id}`}
+                                    >
+                                      <Edit3 className="w-3 h-3 text-slate-600" />
+                                      <span>Edit</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteBooking(b.id)}
+                                      className="p-1 hover:bg-rose-50 text-slate-400 hover:text-rose-600 rounded-lg border border-transparent hover:border-rose-200 transition cursor-pointer"
+                                      title="Delete reservation"
+                                      aria-label={`Delete booking ${b.id}`}
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -4133,10 +4410,10 @@ export default function App() {
                         <Bed className="w-4 h-4 text-[#fdbe4e]" />
                       </div>
                       <div className="text-xl font-bold font-mono text-slate-900">
-                        {dayOccupiedBedsCount} <span className="text-xs font-normal text-slate-400">/ 16 beds</span>
+                        {dayOccupiedBedsCount} <span className="text-xs font-normal text-slate-400">/ {HOSTEL_ROOMS.reduce((s, r) => s + r.capacity, 0)} beds</span>
                       </div>
                       <div className="text-[11px] text-slate-500">
-                        {Math.round((dayOccupiedBedsCount / 16) * 100)}% hostel occupancy rate
+                        {Math.round((dayOccupiedBedsCount / (HOSTEL_ROOMS.reduce((s, r) => s + r.capacity, 0) || 1)) * 100)}% hostel occupancy rate
                       </div>
                     </div>
 

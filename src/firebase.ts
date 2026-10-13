@@ -1,4 +1,4 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
@@ -22,8 +22,8 @@ import {
 import firebaseConfig from '../firebase-applet-config.json';
 import { type Reservation } from './types';
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
+// Initialize Firebase App safely as singleton
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
 // CRITICAL: Initialize Firestore with custom databaseId from firebase-applet-config.json
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -154,6 +154,10 @@ export async function fetchReservationsFromFirestore(): Promise<Reservation[]> {
 }
 
 export async function saveReservationToFirestore(res: Reservation): Promise<void> {
+  if (!auth.currentUser) {
+    console.warn('Skipping saveReservationToFirestore: user is not signed in.');
+    return;
+  }
   const path = `reservations/${res.id}`;
   try {
     const docRef = doc(db, 'reservations', res.id);
@@ -167,6 +171,10 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
 }
 
 export async function deleteReservationFromFirestore(reservationId: string): Promise<void> {
+  if (!auth.currentUser) {
+    console.warn('Skipping deleteReservationFromFirestore: user is not signed in.');
+    return;
+  }
   const path = `reservations/${reservationId}`;
   try {
     const docRef = doc(db, 'reservations', reservationId);
@@ -178,6 +186,10 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
 
 // Clear all reservations from Firestore
 export async function clearAllReservationsFromFirestore(): Promise<number> {
+  if (!auth.currentUser) {
+    console.warn('Skipping clearAllReservationsFromFirestore: user is not signed in.');
+    return 0;
+  }
   const path = 'reservations';
   try {
     const q = query(collection(db, path));
