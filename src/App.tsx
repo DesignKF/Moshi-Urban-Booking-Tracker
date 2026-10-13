@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { User, onAuthStateChanged } from 'firebase/auth';
 import {
   initAuth,
@@ -14,7 +14,10 @@ import {
   deleteReservationFromFirestore,
   clearAllReservationsFromFirestore,
   subscribeToReservations,
-  fetchReservationsFromFirestore
+  fetchReservationsFromFirestore,
+  isAuthorizedAdminEmail,
+  recordUserProfile,
+  AUTHORIZED_ADMIN_EMAILS
 } from './firebase';
 import {
   listUserSpreadsheets,
@@ -70,6 +73,10 @@ import {
   Phone,
   Tag,
   ShieldCheck,
+  Shield,
+  ShieldAlert,
+  Lock,
+  UserCheck,
   Building2,
   ExternalLink,
   Trash2,
@@ -120,6 +127,23 @@ export default function App() {
   const [token, setToken] = useState<string | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+
+  // Admin Authorization State & Modal
+  const [isAdminAuthModalOpen, setIsAdminAuthModalOpen] = useState(false);
+  const [adminAuthReason, setAdminAuthReason] = useState<string>('edit hostel bookings');
+
+  // Verify if current user is an authorized administrator
+  const isAdmin = useMemo(() => {
+    return Boolean(user?.email && isAuthorizedAdminEmail(user.email));
+  }, [user]);
+
+  // Authorization check guard for editing operations
+  const checkAdminAuthorization = (actionDescription = 'edit bookings'): boolean => {
+    if (isAdmin) return true;
+    setAdminAuthReason(actionDescription);
+    setIsAdminAuthModalOpen(true);
+    return false;
+  };
 
   // Active Tab
   const [activeTab, setActiveTab] = useState<'overview' | 'bookings' | 'availability' | 'rooms' | 'sheets' | 'changelog'>('overview');
@@ -305,6 +329,12 @@ export default function App() {
   });
   const [globalSearch, setGlobalSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
+
+  // Date Scope & Range Filters for Bookings
+  const [bookingDateScope, setBookingDateScope] = useState<'all' | 'active' | 'upcoming' | 'past' | 'custom'>('all');
+  const [customStartDate, setCustomStartDate] = useState<string>('');
+  const [customEndDate, setCustomEndDate] = useState<string>('');
+
   const [currency, setCurrency] = useState<'USD' | 'TZS' | 'EUR' | 'GBP'>('USD');
   const CURRENCY_RATES = { USD: 1, TZS: 2645, EUR: 0.92, GBP: 0.79 };
 
@@ -457,6 +487,7 @@ export default function App() {
         setUser(currentUser);
         setToken(accessToken);
         loadSpreadsheets(accessToken);
+        recordUserProfile(currentUser).catch(err => console.warn('User profile sync note:', err));
       },
       () => {
         setUser(null);
@@ -520,7 +551,15 @@ export default function App() {
         setUser(res.user);
         setToken(res.accessToken);
         await loadSpreadsheets(res.accessToken);
-        triggerToast('Connected to Google Account successfully!', 'success');
+        // Persist profile in Firestore and sync role
+        recordUserProfile(res.user).catch(err => console.warn('User profile sync note:', err));
+        const userIsAdmin = isAuthorizedAdminEmail(res.user.email);
+        if (userIsAdmin) {
+          triggerToast(`Admin access authorized for ${res.user.displayName || res.user.email}! Full booking editing enabled.`, 'success');
+          setIsAdminAuthModalOpen(false);
+        } else {
+          triggerToast(`Signed in as ${res.user.displayName || res.user.email} (View-only staff). Admin authorization required to edit bookings.`, 'info');
+        }
       }
     } catch (err: any) {
       console.error('Sign in error:', err);
@@ -536,6 +575,14 @@ export default function App() {
     setUser(null);
     setToken(null);
     triggerToast('Signed out of Google account', 'info');
+  };
+
+  // Switch Google Account
+  const handleSwitchAccount = async () => {
+    await logout();
+    setUser(null);
+    setToken(null);
+    await handleSignIn();
   };
 
   // Load User's Spreadsheets from Drive
@@ -969,6 +1016,7 @@ export default function App() {
 
   // Handle open New Reservation modal
   const handleOpenNewModal = (prefillRoom?: string, prefillDate?: string) => {
+    if (!checkAdminAuthorization('create new bookings')) return;
     const roomObj = prefillRoom
       ? HOSTEL_ROOMS.find(r => prefillRoom.includes(r.name) || r.name.toLowerCase() === prefillRoom.toLowerCase()) || HOSTEL_ROOMS[0]
       : HOSTEL_ROOMS[0];
@@ -1041,6 +1089,7 @@ export default function App() {
 
   // Handle Edit Reservation modal
   const handleOpenEditModal = (r: Reservation) => {
+    if (!checkAdminAuthorization('edit booking details')) return;
     setEditingBooking(r);
 
     // Reconcile bed code with selected room:
@@ -1076,6 +1125,7 @@ export default function App() {
   // Form submit handler: directly saves and syncs to Google Sheet with visual loading feedback
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!checkAdminAuthorization('save reservations')) return;
 
     if (!formData.guestName.trim()) {
       triggerToast('Please provide a guest name', 'error');
@@ -1148,6 +1198,7 @@ export default function App() {
 
   // Check-in guest quick action
   const handleCheckIn = (bookingId: string) => {
+    if (!checkAdminAuthorization('check in guests')) return;
     const booking = reservations.find(r => r.id === bookingId);
     if (!booking) return;
 
@@ -1183,6 +1234,7 @@ export default function App() {
 
   // Check-out guest quick action
   const handleCheckOut = (bookingId: string) => {
+    if (!checkAdminAuthorization('check out guests')) return;
     const booking = reservations.find(r => r.id === bookingId);
     if (!booking) return;
 
@@ -1218,6 +1270,7 @@ export default function App() {
 
   // Quick Collect Balance Full
   const handleConfirmCollect = async () => {
+    if (!checkAdminAuthorization('collect payments')) return;
     if (!collectModalBooking) return;
     const b = collectModalBooking;
     const snapshotBefore = [...reservations];
@@ -1276,6 +1329,7 @@ export default function App() {
   };
 
   const handleDeleteBooking = (bookingId: string) => {
+    if (!checkAdminAuthorization('delete reservations')) return;
     const booking = reservations.find(r => r.id === bookingId);
     if (!booking) return;
     setConfirmModal({
@@ -1388,21 +1442,138 @@ export default function App() {
     return dir === 'asc' ? cmp : -cmp;
   };
 
+  // Today's ISO date string (YYYY-MM-DD) helper
+  const getTodayStr = useCallback(() => {
+    const d = new Date();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }, []);
+
+  // Preset date ranges helper
+  const handleApplyDatePreset = (preset: 'today' | 'this_week' | 'this_month' | 'next_7' | 'next_30') => {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const fmt = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+    if (preset === 'today') {
+      const today = fmt(now);
+      setCustomStartDate(today);
+      setCustomEndDate(today);
+      setBookingDateScope('custom');
+    } else if (preset === 'this_week') {
+      const day = now.getDay();
+      const diffToMon = (day === 0 ? -6 : 1) - day;
+      const mon = new Date(now);
+      mon.setDate(now.getDate() + diffToMon);
+      const sun = new Date(mon);
+      sun.setDate(mon.getDate() + 6);
+      setCustomStartDate(fmt(mon));
+      setCustomEndDate(fmt(sun));
+      setBookingDateScope('custom');
+    } else if (preset === 'this_month') {
+      const first = new Date(now.getFullYear(), now.getMonth(), 1);
+      const last = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      setCustomStartDate(fmt(first));
+      setCustomEndDate(fmt(last));
+      setBookingDateScope('custom');
+    } else if (preset === 'next_7') {
+      const start = new Date(now);
+      const end = new Date(now);
+      end.setDate(now.getDate() + 7);
+      setCustomStartDate(fmt(start));
+      setCustomEndDate(fmt(end));
+      setBookingDateScope('custom');
+    } else if (preset === 'next_30') {
+      const start = new Date(now);
+      const end = new Date(now);
+      end.setDate(now.getDate() + 30);
+      setCustomStartDate(fmt(start));
+      setCustomEndDate(fmt(end));
+      setBookingDateScope('custom');
+    }
+  };
+
+  // Live count breakdown by date category
+  const dateScopeCounts = useMemo(() => {
+    const today = getTodayStr();
+    let active = 0;
+    let upcoming = 0;
+    let past = 0;
+
+    reservations.forEach(r => {
+      const st = (r.status || '').toLowerCase();
+      const isCancelled = st === 'cancelled';
+      const isCheckedOut = st === 'checked-out';
+      const isCheckedIn = st === 'checked-in';
+
+      // Active: currently in-house or overlapping today (not cancelled or already checked-out)
+      if (isCheckedIn || (!isCancelled && !isCheckedOut && r.checkIn <= today && r.checkOut >= today)) {
+        active++;
+      } else if (!isCancelled && !isCheckedOut && (r.checkIn > today || (r.checkIn === today && !isCheckedIn))) {
+        // Upcoming: future arrival
+        upcoming++;
+      } else if (isCheckedOut || r.checkOut < today) {
+        // Past: departed or checkOut before today
+        past++;
+      }
+    });
+
+    return {
+      all: reservations.length,
+      active,
+      upcoming,
+      past
+    };
+  }, [reservations, getTodayStr]);
+
   // Filtered and sorted reservations for the bookings tab
   const filteredBookings = useMemo(() => {
+    const today = getTodayStr();
+
     return reservations
       .filter(r => {
+        // Status Filter
         if (statusFilter !== 'ALL' && r.status.toLowerCase() !== statusFilter.toLowerCase()) {
           return false;
         }
+
+        // Global Search
         if (globalSearch.trim()) {
           const text = `${r.id} ${r.guestName} ${r.phone} ${r.room} ${r.unitId} ${r.status} ${r.notes}`.toLowerCase();
           if (!text.includes(globalSearch.toLowerCase().trim())) return false;
         }
+
+        // Date Scope Filter (Active, Upcoming, Past, Custom)
+        if (bookingDateScope === 'active') {
+          const st = (r.status || '').toLowerCase();
+          const isCancelled = st === 'cancelled';
+          const isCheckedOut = st === 'checked-out';
+          const isCheckedIn = st === 'checked-in';
+          const isStaying = !isCancelled && !isCheckedOut && r.checkIn <= today && r.checkOut >= today;
+          if (!isCheckedIn && !isStaying) return false;
+        } else if (bookingDateScope === 'upcoming') {
+          const st = (r.status || '').toLowerCase();
+          const isCancelled = st === 'cancelled';
+          const isCheckedOut = st === 'checked-out';
+          const isCheckedIn = st === 'checked-in';
+          const isUpcoming = !isCancelled && !isCheckedOut && (r.checkIn > today || (r.checkIn === today && !isCheckedIn));
+          if (!isUpcoming) return false;
+        } else if (bookingDateScope === 'past') {
+          const st = (r.status || '').toLowerCase();
+          const isCheckedOut = st === 'checked-out';
+          const isPastDates = r.checkOut < today;
+          if (!isCheckedOut && !isPastDates) return false;
+        } else if (bookingDateScope === 'custom') {
+          if (customStartDate && r.checkOut < customStartDate) return false;
+          if (customEndDate && r.checkIn > customEndDate) return false;
+        }
+
         return true;
       })
       .sort((a, b) => sortReservations(a, b, sortField, sortDirection));
-  }, [reservations, statusFilter, globalSearch, sortField, sortDirection]);
+  }, [reservations, statusFilter, globalSearch, sortField, sortDirection, bookingDateScope, customStartDate, customEndDate, getTodayStr]);
 
   // Toggle sorting field and direction
   const handleSortToggle = (field: SortField) => {
@@ -1476,6 +1647,7 @@ export default function App() {
 
   // Batch action: Change status for all selected bookings
   const handleBatchStatusChange = async (newStatus: string) => {
+    if (!checkAdminAuthorization('batch change booking status')) return;
     if (selectedBookingIds.length === 0) return;
     setShowBatchStatusMenu(false);
     const count = selectedBookingIds.length;
@@ -1532,6 +1704,7 @@ export default function App() {
 
   // Batch action: Collect balance / Mark fully paid
   const handleBatchCollectBalance = async () => {
+    if (!checkAdminAuthorization('batch collect payments')) return;
     if (selectedBookingIds.length === 0) return;
     const count = selectedBookingIds.length;
     setIsBatchProcessing(true);
@@ -1589,6 +1762,7 @@ export default function App() {
   };
 
   const handleBatchDelete = () => {
+    if (!checkAdminAuthorization('batch delete reservations')) return;
     if (!selectedBookingIds.length) return;
     const ids = [...selectedBookingIds];
     setConfirmModal({
@@ -1615,6 +1789,7 @@ export default function App() {
   };
 
   const handleFreshStartWipeAll = () => {
+    if (!checkAdminAuthorization('wipe all reservations')) return;
     setConfirmModal({
       isOpen: true, title: 'Fresh Start: Remove All Booking Records',
       message: 'Remove all booking records from the app, Firebase and the connected booking tab? Spreadsheet rows, formatting and calculation formulas will remain.',
@@ -2335,34 +2510,6 @@ export default function App() {
           {/* Right Header Buttons */}
           <div className="flex items-center space-x-1.5 sm:space-x-3">
 
-            {/* Live Auto-Sync Indicator & Quick Refresh */}
-            {selectedSheetId && (
-              <div className="hidden lg:flex items-center space-x-2 px-3 py-1.5 rounded-xl bg-[#faf8f5] border border-[#e8e4dc] text-[11px]">
-                <span className={`w-2 h-2 rounded-full ${autoSyncInterval !== 'off' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`} />
-                <span className="font-semibold text-slate-700">
-                  {autoSyncInterval !== 'off' ? `Auto-Sync (${autoSyncSecondsLeft}s)` : 'Manual Sync'}
-                </span>
-                <button
-                  onClick={() => syncFromGoogleSheet()}
-                  disabled={isSyncing}
-                  title="Pull latest updates now"
-                  className="text-slate-400 hover:text-slate-800 transition p-0.5 rounded cursor-pointer"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-[#fdbe4e]' : ''}`} />
-                </button>
-              </div>
-            )}
-
-            {/* Google Sheet Automations Modal Button */}
-            <button
-              onClick={() => setIsAutomationsModalOpen(true)}
-              className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-950 border border-amber-200/80 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
-              title="Google Sheet Automations, Dropdowns & Apps Script"
-            >
-              <Zap className="w-3.5 h-3.5 text-[#fdbe4e]" />
-              <span>Sheet Automations</span>
-            </button>
-
             {/* Action Items Notification Bell */}
             <div className="relative">
               <button
@@ -2464,71 +2611,34 @@ export default function App() {
               )}
             </div>
 
-            {/* Firebase Cloud Sync Button */}
-            <button
-              onClick={() => handleSyncAllToFirestore()}
-              disabled={isFirebaseSyncing}
-              title={firestoreConnected ? 'Firebase Cloud Database active. Click to sync all local records to Firebase.' : 'Firebase Cloud Database'}
-              className={`hidden md:flex items-center space-x-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition border cursor-pointer ${
-                firestoreConnected
-                  ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-200'
-                  : 'bg-slate-50 text-slate-500 border-slate-200'
-              }`}
-            >
-              <Flame className={`w-3.5 h-3.5 ${isFirebaseSyncing ? 'animate-bounce text-[#fdbe4e]' : 'text-[#fdbe4e]'}`} />
-              <span className="hidden xl:inline">
-                {isFirebaseSyncing ? 'Syncing Firebase...' : 'Firebase Cloud'}
-              </span>
-            </button>
-
-            {/* Direct Google Sheets Sync Button */}
-            <button
-              onClick={() => syncFromGoogleSheet()}
-              disabled={isSyncing}
-              className={`hidden sm:flex items-center space-x-2 px-3 py-1.5 rounded-xl text-xs font-semibold transition border ${
-                user && selectedSheetId
-                  ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
-                  : 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
-              }`}
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-emerald-600' : ''}`} />
-              <span className="hidden lg:inline">
-                {isSyncing
-                  ? 'Syncing...'
-                  : user && selectedSheetId
-                  ? 'Sheet Synced'
-                  : 'Connect Sheet'}
-              </span>
-            </button>
-
-            {/* Live Bidirectional Sync Test Button */}
-            {selectedSheetId && (
+            {/* Admin Authorization Status Pill */}
+            {isAdmin ? (
               <button
-                onClick={() => {
-                  setIsSyncTestModalOpen(true);
-                  if (!isTestingSync && !syncTestReport) {
-                    handleRunBidirectionalTest();
-                  }
-                }}
-                disabled={isTestingSync}
-                className="hidden md:flex items-center space-x-1.5 px-3 py-1.5 bg-[#0d1726] hover:bg-[#1b2b45] text-white rounded-xl text-xs font-bold transition cursor-pointer shadow-2xs disabled:opacity-50"
-                title="Run live bidirectional verification test (App ⇄ Google Sheet)"
+                onClick={() => setIsAdminAuthModalOpen(true)}
+                className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
+                title={`Hostel Administrator Authorized: ${user?.email}. Full booking editing unlocked.`}
               >
-                <Activity className={`w-3.5 h-3.5 text-[#fdbe4e] ${isTestingSync ? 'animate-pulse' : ''}`} />
-                <span>Test Sync</span>
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="font-bold">Admin:</span>
+                <span className="font-mono text-[11px] text-emerald-800 truncate max-w-[120px]">{user?.email?.split('@')[0]}</span>
               </button>
-            )}
-
-            {/* Fix Sheet #REF! Errors Button */}
-            {selectedSheetId && (
+            ) : user ? (
               <button
-                onClick={handleRepairSheetRefErrors}
-                disabled={isFixingRefErrors}
-                className="hidden xl:flex items-center space-x-1.5 px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-900 border border-rose-200 rounded-xl text-xs font-semibold transition cursor-pointer disabled:opacity-50"
-                title="Check all workbook tabs for formula errors"
+                onClick={() => setIsAdminAuthModalOpen(true)}
+                className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
+                title={`Staff Account: ${user.email}. Admin authorization required to edit bookings.`}
               >
-                <Wrench className={`w-3.5 h-3.5 text-rose-600 ${isFixingRefErrors ? 'animate-spin' : ''}`} />
-                <span>Check formulas</span>
+                <ShieldAlert className="w-3.5 h-3.5 text-amber-600" />
+                <span>Staff (View-Only)</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => setIsAdminAuthModalOpen(true)}
+                className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-[#f6f3ed] hover:bg-amber-50 text-slate-700 hover:text-amber-950 border border-[#e5dfd3] hover:border-amber-300 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
+                title="Admin Access Authorization. Click to log in as authorized admin."
+              >
+                <Lock className="w-3.5 h-3.5 text-amber-600" />
+                <span>Admin Login</span>
               </button>
             )}
 
@@ -2944,31 +3054,227 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Status Filter Segmented Controls */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-2.5 sm:p-3 rounded-2xl border border-[#e8e4dc]">
-                <div className="flex flex-wrap items-center gap-1 p-1 bg-[#f5f2eb] rounded-xl">
-                  {(['ALL', 'Confirmed', 'Checked-in', 'Checked-out', 'Tentative', 'Cancelled'] as const).map(st => (
+              {/* Comprehensive Filters Bar: Global Date-Range & Status */}
+              <div className="bg-white p-3.5 sm:p-4 rounded-2xl border border-[#e8e4dc] shadow-2xs space-y-3">
+                {/* 1. Global Date-Range Filter */}
+                <div className="space-y-2">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-2.5">
+                    <div className="flex items-center space-x-2">
+                      <div className="w-7 h-7 rounded-lg bg-amber-50 text-amber-700 flex items-center justify-center font-bold">
+                        <CalendarDays className="w-4 h-4 text-[#fdbe4e]" />
+                      </div>
+                      <span className="text-xs font-bold text-slate-800">Date Range Filter:</span>
+                      <span className="text-[11px] text-slate-400">
+                        {bookingDateScope === 'all'
+                          ? 'All dates'
+                          : bookingDateScope === 'active'
+                          ? 'Active in-house guests'
+                          : bookingDateScope === 'upcoming'
+                          ? 'Upcoming future arrivals'
+                          : bookingDateScope === 'past'
+                          ? 'Past completed stays'
+                          : 'Custom stay period'}
+                      </span>
+                    </div>
+
+                    {/* Active filter badge & reset if filtered */}
+                    {(bookingDateScope !== 'all' || statusFilter !== 'ALL' || customStartDate || customEndDate) && (
+                      <div className="flex items-center space-x-2">
+                        <button
+                          onClick={() => {
+                            setBookingDateScope('all');
+                            setStatusFilter('ALL');
+                            setCustomStartDate('');
+                            setCustomEndDate('');
+                          }}
+                          className="text-[11px] font-semibold text-rose-600 hover:text-rose-800 bg-rose-50 hover:bg-rose-100 border border-rose-200 px-2.5 py-1 rounded-lg transition cursor-pointer flex items-center space-x-1"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Reset All Filters</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Date Scope Toggles */}
+                  <div className="flex flex-wrap items-center gap-1.5 p-1 bg-[#f5f2eb] rounded-xl text-xs font-semibold">
+                    {/* All Dates */}
                     <button
-                      key={st}
-                      onClick={() => setStatusFilter(st)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                        statusFilter === st
-                          ? 'bg-white text-slate-900 shadow-xs'
+                      onClick={() => setBookingDateScope('all')}
+                      className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        bookingDateScope === 'all'
+                          ? 'bg-white text-slate-900 shadow-xs font-bold'
                           : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
                       }`}
                     >
-                      {st === 'ALL' ? 'All Bookings' : st}
+                      <span>All Dates</span>
+                      <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-slate-200 text-slate-700">
+                        {dateScopeCounts.all}
+                      </span>
                     </button>
-                  ))}
+
+                    {/* Active Bookings (Currently In-House) */}
+                    <button
+                      onClick={() => setBookingDateScope('active')}
+                      className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        bookingDateScope === 'active'
+                          ? 'bg-emerald-600 text-white shadow-xs font-bold'
+                          : 'text-emerald-800 hover:text-emerald-950 hover:bg-emerald-50'
+                      }`}
+                      title="Guests currently staying or checked in today"
+                    >
+                      <span className={`w-2 h-2 rounded-full ${bookingDateScope === 'active' ? 'bg-white' : 'bg-emerald-500'} animate-pulse`} />
+                      <span>Active (In-House)</span>
+                      <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded-full font-bold ${
+                        bookingDateScope === 'active' ? 'bg-emerald-700 text-white' : 'bg-emerald-100 text-emerald-800'
+                      }`}>
+                        {dateScopeCounts.active}
+                      </span>
+                    </button>
+
+                    {/* Upcoming Bookings */}
+                    <button
+                      onClick={() => setBookingDateScope('upcoming')}
+                      className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        bookingDateScope === 'upcoming'
+                          ? 'bg-blue-600 text-white shadow-xs font-bold'
+                          : 'text-blue-800 hover:text-blue-950 hover:bg-blue-50'
+                      }`}
+                      title="Future arrivals with check-in dates ahead"
+                    >
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>Upcoming</span>
+                      <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded-full font-bold ${
+                        bookingDateScope === 'upcoming' ? 'bg-blue-700 text-white' : 'bg-blue-100 text-blue-800'
+                      }`}>
+                        {dateScopeCounts.upcoming}
+                      </span>
+                    </button>
+
+                    {/* Past Bookings */}
+                    <button
+                      onClick={() => setBookingDateScope('past')}
+                      className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        bookingDateScope === 'past'
+                          ? 'bg-slate-700 text-white shadow-xs font-bold'
+                          : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
+                      }`}
+                      title="Guests who have already departed or checked out"
+                    >
+                      <History className="w-3.5 h-3.5" />
+                      <span>Past</span>
+                      <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded-full font-bold ${
+                        bookingDateScope === 'past' ? 'bg-slate-800 text-white' : 'bg-slate-200 text-slate-700'
+                      }`}>
+                        {dateScopeCounts.past}
+                      </span>
+                    </button>
+
+                    {/* Custom Range */}
+                    <button
+                      onClick={() => setBookingDateScope('custom')}
+                      className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center space-x-1.5 ${
+                        bookingDateScope === 'custom'
+                          ? 'bg-[#fdbe4e] text-[#0d1726] shadow-xs font-bold'
+                          : 'text-amber-900 hover:bg-amber-100/60'
+                      }`}
+                    >
+                      <SlidersHorizontal className="w-3.5 h-3.5" />
+                      <span>Custom Range</span>
+                      {(customStartDate || customEndDate) && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-900" />
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Expandable Custom Date Range Selector (When 'custom' is active) */}
+                  {bookingDateScope === 'custom' && (
+                    <div className="p-3 bg-[#faf8f5] rounded-xl border border-[#ede9e1] animate-in fade-in duration-150 space-y-2.5">
+                      <div className="flex flex-wrap items-center gap-2.5 text-xs">
+                        <div className="flex items-center space-x-1.5">
+                          <label className="text-[11px] font-semibold text-slate-600">From:</label>
+                          <input
+                            type="date"
+                            value={customStartDate}
+                            onChange={e => setCustomStartDate(e.target.value)}
+                            className="bg-white border border-[#e8e4dc] rounded-lg px-2.5 py-1 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                          />
+                        </div>
+
+                        <div className="flex items-center space-x-1.5">
+                          <label className="text-[11px] font-semibold text-slate-600">To:</label>
+                          <input
+                            type="date"
+                            value={customEndDate}
+                            onChange={e => setCustomEndDate(e.target.value)}
+                            className="bg-white border border-[#e8e4dc] rounded-lg px-2.5 py-1 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                          />
+                        </div>
+
+                        {(customStartDate || customEndDate) && (
+                          <button
+                            onClick={() => {
+                              setCustomStartDate('');
+                              setCustomEndDate('');
+                            }}
+                            className="text-[11px] text-slate-500 hover:text-slate-800 px-2 py-1 rounded bg-white border border-slate-200 transition cursor-pointer"
+                          >
+                            Clear Dates
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Quick Date Presets */}
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-[#f0ede6] text-[11px]">
+                        <span className="text-slate-400 font-medium">Quick Presets:</span>
+                        {(['today', 'this_week', 'this_month', 'next_7', 'next_30'] as const).map(preset => (
+                          <button
+                            key={preset}
+                            onClick={() => handleApplyDatePreset(preset)}
+                            className="px-2 py-0.5 rounded-md bg-white hover:bg-amber-50 text-slate-700 hover:text-amber-900 border border-[#e8e4dc] transition cursor-pointer font-medium"
+                          >
+                            {preset === 'today'
+                              ? 'Today'
+                              : preset === 'this_week'
+                              ? 'This Week'
+                              : preset === 'this_month'
+                              ? 'This Month'
+                              : preset === 'next_7'
+                              ? 'Next 7 Days'
+                              : 'Next 30 Days'}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
-                <div className="flex items-center space-x-3 text-xs text-slate-500 font-mono px-2">
-                  <span>Showing <strong>{filteredBookings.length}</strong> of {reservations.length} records</span>
-                  {selectedBookingIds.length > 0 && (
-                    <span className="bg-amber-100 text-amber-900 font-semibold px-2 py-0.5 rounded-full border border-amber-300 text-[11px]">
-                      {selectedBookingIds.length} selected
-                    </span>
-                  )}
+                {/* 2. Status Filter Segmented Controls */}
+                <div className="pt-2.5 border-t border-[#f1ede4] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-1 p-1 bg-[#f5f2eb] rounded-xl">
+                    {(['ALL', 'Confirmed', 'Checked-in', 'Checked-out', 'Tentative', 'Cancelled'] as const).map(st => (
+                      <button
+                        key={st}
+                        onClick={() => setStatusFilter(st)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                          statusFilter === st
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
+                        }`}
+                      >
+                        {st === 'ALL' ? 'All Statuses' : st}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex items-center space-x-3 text-xs text-slate-500 font-mono px-2">
+                    <span>Showing <strong>{filteredBookings.length}</strong> of {reservations.length} records</span>
+                    {selectedBookingIds.length > 0 && (
+                      <span className="bg-amber-100 text-amber-900 font-semibold px-2 py-0.5 rounded-full border border-amber-300 text-[11px]">
+                        {selectedBookingIds.length} selected
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -3477,14 +3783,19 @@ export default function App() {
                                   className="px-4 py-2 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer"
                                 >
                                   <Plus className="w-3.5 h-3.5" />
-                                  <span>+ New Booking</span>
+                                  <span>New Booking</span>
                                 </button>
                                 {reservations.length > 0 && (
                                   <button
-                                    onClick={() => setStatusFilter('ALL')}
+                                    onClick={() => {
+                                      setStatusFilter('ALL');
+                                      setBookingDateScope('all');
+                                      setCustomStartDate('');
+                                      setCustomEndDate('');
+                                    }}
                                     className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl transition cursor-pointer"
                                   >
-                                    Reset Status Filter
+                                    Reset All Filters
                                   </button>
                                 )}
                               </div>
@@ -4325,6 +4636,96 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Authorized Administrators & Permissions Card */}
+              <div className="bg-white rounded-2xl border border-[#e8e4dc] p-6 shadow-2xs space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center space-x-3">
+                    <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center font-bold">
+                      <ShieldCheck className="w-6 h-6 text-[#fdbe4e]" />
+                    </div>
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <h3 className="font-bold text-sm text-slate-900 font-serif">Admin Access Authorization</h3>
+                        {isAdmin ? (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                            <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                            <span>Authorized Admin Active</span>
+                          </span>
+                        ) : user ? (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200">
+                            <ShieldAlert className="w-3.5 h-3.5 text-amber-600" />
+                            <span>Staff (View-Only)</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-600 bg-slate-100 px-2 py-0.5 rounded-md border border-slate-200">
+                            <Lock className="w-3 h-3 text-slate-500" />
+                            <span>Login Required to Edit</span>
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        Only authorized Google Administrator accounts are granted permission to create, edit, check-in, check-out, and delete bookings.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div>
+                    {isAdmin ? (
+                      <span className="text-xs font-mono font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-3 py-1.5 rounded-xl block text-center">
+                        ✓ {user?.email}
+                      </span>
+                    ) : user ? (
+                      <button
+                        onClick={handleSwitchAccount}
+                        className="px-3.5 py-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer"
+                      >
+                        <LogIn className="w-3.5 h-3.5" />
+                        <span>Switch to Admin Account</span>
+                      </button>
+                    ) : (
+                      <button
+                        onClick={handleSignIn}
+                        disabled={isSigningIn}
+                        className="px-3.5 py-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer"
+                      >
+                        <LogIn className="w-3.5 h-3.5" />
+                        <span>Admin Login</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 text-xs">
+                  {[
+                    { email: 'wolfgodie@gmail.com', name: 'Wolfgodie Admin', role: 'Hostel Administrator' },
+                    { email: 'gdnjau@gmail.com', name: 'Godwin Njau', role: 'Hostel Administrator' },
+                    { email: 'moshiurbanproperty@gmail.com', name: 'Moshi Urban Property', role: 'Property Administrator' }
+                  ].map(acc => {
+                    const isCurrent = user?.email?.toLowerCase().trim() === acc.email;
+                    return (
+                      <div key={acc.email} className={`p-3.5 rounded-xl border transition ${
+                        isCurrent
+                          ? 'bg-emerald-50/70 border-emerald-300 ring-1 ring-emerald-300'
+                          : 'bg-[#faf8f5] border-[#ede9e1]'
+                      }`}>
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="font-bold text-slate-900 text-xs">{acc.name}</span>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
+                            isCurrent
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-amber-100 text-amber-900'
+                          }`}>
+                            {isCurrent ? 'Active Now' : 'Authorized'}
+                          </span>
+                        </div>
+                        <div className="font-mono text-[11px] text-slate-700 truncate">{acc.email}</div>
+                        <div className="text-[10px] text-slate-400 mt-1">{acc.role}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
               {/* Account Connection Card */}
               <div className="bg-white rounded-2xl border border-[#e8e4dc] p-6 shadow-2xs space-y-5">
                 <div className="flex items-center justify-between">
@@ -5057,6 +5458,187 @@ export default function App() {
         </footer>
 
       </div>
+
+      {/* HOSTEL ADMIN AUTHORIZATION MODAL */}
+      {isAdminAuthModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-[#e8e4dc] my-6 animate-in fade-in zoom-in-95 duration-200">
+            {/* Modal Header */}
+            <div className="flex items-start justify-between pb-4 border-b border-[#f1ede4]">
+              <div className="flex items-center space-x-3">
+                <div className={`w-11 h-11 rounded-2xl flex items-center justify-center ${
+                  isAdmin ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50 text-amber-600'
+                }`}>
+                  {isAdmin ? <ShieldCheck className="w-6 h-6 text-emerald-600" /> : <Lock className="w-6 h-6 text-amber-600" />}
+                </div>
+                <div>
+                  <h3 className="text-base font-bold font-serif text-slate-900">
+                    Administrator Authorization
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Hostel Booking Management & Access Control
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAdminAuthModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Content */}
+            <div className="mt-4 space-y-4 text-xs">
+              {isAdmin ? (
+                /* Status: Authorized Admin */
+                <div className="space-y-3">
+                  <div className="p-3.5 bg-emerald-50 rounded-2xl border border-emerald-200 text-emerald-950 flex items-start space-x-3">
+                    <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                    <div>
+                      <strong className="block font-bold text-xs text-emerald-950">
+                        Admin Access Active & Verified
+                      </strong>
+                      <p className="text-[11px] text-emerald-800 mt-0.5 leading-relaxed">
+                        Signed in as <span className="font-bold underline">{user?.email}</span>. You have full administrative authorization to create, modify, check-in, check-out, collect payments, delete, and synchronize bookings with Google Sheets.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-[#faf8f5] rounded-2xl border border-[#ede9e1] space-y-2">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                      Authorized Admin Google Accounts:
+                    </span>
+                    <div className="space-y-1.5 font-mono text-[11px]">
+                      {[
+                        { email: 'wolfgodie@gmail.com', role: 'Hostel Administrator' },
+                        { email: 'gdnjau@gmail.com', role: 'Hostel Administrator' },
+                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Administrator' }
+                      ].map(acc => (
+                        <div key={acc.email} className={`flex items-center justify-between p-2 rounded-xl border ${
+                          user?.email?.toLowerCase().trim() === acc.email
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-900 font-bold'
+                            : 'bg-white border-[#f1ede4] text-slate-700'
+                        }`}>
+                          <div className="flex items-center space-x-2 truncate">
+                            <span className={`w-2 h-2 rounded-full ${user?.email?.toLowerCase().trim() === acc.email ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'}`} />
+                            <span className="truncate">{acc.email}</span>
+                          </div>
+                          <span className="text-[10px] font-sans text-slate-500 shrink-0">
+                            {user?.email?.toLowerCase().trim() === acc.email ? '● Current' : acc.role}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ) : user ? (
+                /* Status: Logged in with unauthorized account (Staff view-only) */
+                <div className="space-y-3">
+                  <div className="p-3.5 bg-amber-50 rounded-2xl border border-amber-200 text-amber-950 flex items-start space-x-3">
+                    <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <strong className="block font-bold text-xs text-amber-950">
+                        Admin Authorization Required
+                      </strong>
+                      <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
+                        Signed in as <span className="font-bold underline">{user.email}</span> (Staff / View-only). To {adminAuthReason}, you must switch to an authorized Google Administrator account.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-[#faf8f5] rounded-2xl border border-[#ede9e1] space-y-2">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
+                      Permitted Administrator Google Accounts:
+                    </span>
+                    <div className="space-y-1.5 font-mono text-[11px]">
+                      {[
+                        { email: 'wolfgodie@gmail.com', role: 'Hostel Administrator' },
+                        { email: 'gdnjau@gmail.com', role: 'Hostel Administrator' },
+                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Administrator' }
+                      ].map(acc => (
+                        <div key={acc.email} className="flex items-center justify-between p-2 rounded-xl bg-white border border-[#f1ede4] text-slate-700">
+                          <div className="flex items-center space-x-2 truncate">
+                            <Shield className="w-3.5 h-3.5 text-[#fdbe4e]" />
+                            <span className="truncate">{acc.email}</span>
+                          </div>
+                          <span className="text-[10px] font-sans text-slate-400 shrink-0">{acc.role}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={handleSwitchAccount}
+                    disabled={isSigningIn}
+                    className="w-full py-2.5 px-4 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold rounded-xl shadow-xs transition flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <LogIn className="w-4 h-4" />
+                    <span>Switch to Authorized Admin Account</span>
+                  </button>
+                </div>
+              ) : (
+                /* Status: Not signed in */
+                <div className="space-y-3">
+                  <div className="p-3.5 bg-amber-50 rounded-2xl border border-amber-200 text-amber-950 flex items-start space-x-3">
+                    <Lock className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <strong className="block font-bold text-xs text-amber-950">
+                        Admin Sign-In Required
+                      </strong>
+                      <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
+                        To {adminAuthReason}, please sign in using one of the authorized Google Administrator accounts.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-[#faf8f5] rounded-2xl border border-[#ede9e1] space-y-2">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
+                      Authorized Admin Google Accounts:
+                    </span>
+                    <div className="space-y-1.5 font-mono text-[11px]">
+                      {[
+                        { email: 'wolfgodie@gmail.com', role: 'Hostel Administrator' },
+                        { email: 'gdnjau@gmail.com', role: 'Hostel Administrator' },
+                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Administrator' }
+                      ].map(acc => (
+                        <div key={acc.email} className="flex items-center justify-between p-2 rounded-xl bg-white border border-[#f1ede4] text-slate-700">
+                          <div className="flex items-center space-x-2 truncate">
+                            <Shield className="w-3.5 h-3.5 text-[#fdbe4e]" />
+                            <span className="truncate">{acc.email}</span>
+                          </div>
+                          <span className="text-[10px] font-sans text-slate-400 shrink-0">{acc.role}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={handleSignIn}
+                    disabled={isSigningIn}
+                    className="w-full py-2.5 px-4 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold rounded-xl shadow-xs transition flex items-center justify-center space-x-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <LogIn className="w-4 h-4" />
+                    <span>{isSigningIn ? 'Signing in with Google...' : 'Sign in with Google Admin Account'}</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="mt-5 pt-3 border-t border-[#f1ede4] flex justify-end">
+              <button
+                type="button"
+                onClick={() => setIsAdminAuthModalOpen(false)}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-xl transition cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* CREATE / EDIT RESERVATION MODAL */}
       {isBookingModalOpen && (

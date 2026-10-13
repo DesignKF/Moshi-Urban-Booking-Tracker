@@ -93,6 +93,35 @@ export async function testFirestoreConnection(): Promise<boolean> {
   }
 }
 
+export const AUTHORIZED_ADMIN_EMAILS = [
+  'wolfgodie@gmail.com',
+  'gdnjau@gmail.com',
+  'moshiurbanproperty@gmail.com',
+  'designkilifair@gmail.com'
+];
+
+export function isAuthorizedAdminEmail(email?: string | null): boolean {
+  if (!email) return false;
+  return AUTHORIZED_ADMIN_EMAILS.includes(email.toLowerCase().trim());
+}
+
+export async function recordUserProfile(user: FirebaseUser): Promise<void> {
+  const path = `users/${user.uid}`;
+  try {
+    const docRef = doc(db, 'users', user.uid);
+    const isAdmin = isAuthorizedAdminEmail(user.email);
+    await setDoc(docRef, {
+      uid: user.uid,
+      email: user.email?.toLowerCase().trim() || '',
+      displayName: user.displayName || '',
+      role: isAdmin ? 'admin' : 'staff',
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
 // Authentication Helpers
 export async function signInWithGoogleFirebase(): Promise<FirebaseUser | null> {
   try {
