@@ -2156,7 +2156,7 @@ export default function App() {
               <div className="p-2.5 bg-amber-50 rounded-xl">
                 <AlertCircle className="w-6 h-6 text-amber-600" />
               </div>
-              <h3 className="text-lg font-bold text-slate-900 font-serif">{confirmModal.title}</h3>
+              <h3 className="text-lg font-semibold text-slate-900">{confirmModal.title}</h3>
             </div>
             <p className="text-xs text-slate-600 mb-6 leading-relaxed">{confirmModal.message}</p>
             <div className="flex justify-end space-x-2.5">
@@ -2683,8 +2683,8 @@ export default function App() {
               
               {/* Header Title */}
               <div>
-                <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">Overview</h1>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <h1 className="text-2xl sm:text-3xl font-semibold text-slate-900 tracking-tight">Overview</h1>
+                <p className="text-xs sm:text-sm text-slate-500 mt-1">
                   Daily operational tasks, live room and bed inventory, pending payments, and revenue synchronized with Google Sheets.
                 </p>
               </div>
@@ -2698,10 +2698,10 @@ export default function App() {
                         <AlertTriangle className="w-4 h-4 text-slate-950" />
                       </div>
                       <div>
-                        <h3 className="font-bold text-slate-900 text-xs tracking-tight">
+                        <h3 className="font-semibold text-slate-900 text-xs sm:text-sm tracking-tight">
                           Action Required ({actionItems.length} items)
                         </h3>
-                        <p className="text-[10px] text-amber-900/70">
+                        <p className="text-[10px] sm:text-xs text-amber-900/70">
                           Critical alerts, room mismatches, or arrivals requiring attention
                         </p>
                       </div>
@@ -2722,18 +2722,18 @@ export default function App() {
                       >
                         <div>
                           <div className="flex items-center justify-between">
-                            <span className="text-[11px] font-bold text-slate-900 line-clamp-1">{item.title}</span>
+                            <span className="text-[11px] sm:text-xs font-semibold text-slate-900 line-clamp-1">{item.title}</span>
                             {item.severity === 'high' && (
                               <span className="text-[9px] font-bold bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded">
                                 Urgent
                               </span>
                             )}
                           </div>
-                          <p className="text-[10px] text-slate-500 mt-1 line-clamp-2 leading-relaxed">
+                          <p className="text-[10px] sm:text-[11px] text-slate-500 mt-1 line-clamp-2 leading-relaxed">
                             {item.description}
                           </p>
                         </div>
-                        <div className="mt-2 text-[10px] text-amber-700 font-bold flex items-center space-x-1">
+                        <div className="mt-2 text-[10px] sm:text-xs text-amber-700 font-semibold flex items-center space-x-1">
                           <span>Review & fix</span>
                           <span>&rarr;</span>
                         </div>
@@ -2747,9 +2747,9 @@ export default function App() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
                 <div className="bg-white p-4 sm:p-5 rounded-2xl border border-[#e8e4dc] shadow-2xs flex justify-between items-start">
                   <div>
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Arrivals today</span>
-                    <h3 className="text-2xl sm:text-3xl font-bold text-slate-900 font-serif mt-1">{arrivalsToday.length}</h3>
-                    <p className="text-[11px] text-slate-500 mt-1">
+                    <span className="text-[11px] sm:text-xs font-semibold uppercase tracking-wider text-slate-400">Arrivals today</span>
+                    <h3 className="text-2xl sm:text-3xl font-semibold text-slate-900 tabular-nums mt-1">{arrivalsToday.length}</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500 mt-1">
                       {arrivalsToday.filter(r => r.status.toLowerCase() !== 'checked-in').length} awaiting check-in
                     </p>
                   </div>
@@ -2760,9 +2760,9 @@ export default function App() {
 
                 <div className="bg-white p-4 sm:p-5 rounded-2xl border border-[#e8e4dc] shadow-2xs flex justify-between items-start">
                   <div>
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Departures today</span>
-                    <h3 className="text-2xl sm:text-3xl font-bold text-slate-900 font-serif mt-1">{departuresToday}</h3>
-                    <p className="text-[11px] text-slate-500 mt-1">Check-out by 10:00 AM</p>
+                    <span className="text-[11px] sm:text-xs font-semibold uppercase tracking-wider text-slate-400">Departures today</span>
+                    <h3 className="text-2xl sm:text-3xl font-semibold text-slate-900 tabular-nums mt-1">{departuresToday}</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500 mt-1">Check-out by 10:00 AM</p>
                   </div>
                   <span className="text-rose-700 bg-rose-50 p-2.5 rounded-xl border border-rose-100">
                     <LogOut className="w-4 h-4" />
@@ -2771,9 +2771,9 @@ export default function App() {
 
                 <div className="bg-white p-4 sm:p-5 rounded-2xl border border-[#e8e4dc] shadow-2xs flex justify-between items-start">
                   <div>
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Checked-in</span>
-                    <h3 className="text-2xl sm:text-3xl font-bold text-slate-900 font-serif mt-1">{checkedInCount}</h3>
-                    <p className="text-[11px] text-slate-500 mt-1">{checkedInCount} guests in-house</p>
+                    <span className="text-[11px] sm:text-xs font-semibold uppercase tracking-wider text-slate-400">Checked-in</span>
+                    <h3 className="text-2xl sm:text-3xl font-semibold text-slate-900 tabular-nums mt-1">{checkedInCount}</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500 mt-1">{checkedInCount} guests in-house</p>
                   </div>
                   <span className="text-blue-700 bg-blue-50 p-2.5 rounded-xl border border-blue-100">
                     <Users className="w-4 h-4" />
@@ -2782,9 +2782,9 @@ export default function App() {
 
                 <div className="bg-white p-4 sm:p-5 rounded-2xl border border-[#e8e4dc] shadow-2xs flex justify-between items-start">
                   <div>
-                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Beds free tonight</span>
-                    <h3 className="text-2xl sm:text-3xl font-bold text-slate-900 font-serif mt-1">{freeBedsCount}</h3>
-                    <p className="text-[11px] text-slate-500 mt-1">{bookedBedsCount} of 16 beds booked</p>
+                    <span className="text-[11px] sm:text-xs font-semibold uppercase tracking-wider text-slate-400">Beds free tonight</span>
+                    <h3 className="text-2xl sm:text-3xl font-semibold text-slate-900 tabular-nums mt-1">{freeBedsCount}</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500 mt-1">{bookedBedsCount} of 16 beds booked</p>
                   </div>
                   <span className="text-amber-800 bg-amber-50 p-2.5 rounded-xl border border-amber-100">
                     <Bed className="w-4 h-4" />
@@ -2796,8 +2796,8 @@ export default function App() {
               <div className="bg-white rounded-2xl border border-[#e8e4dc] p-4 sm:p-5 shadow-2xs space-y-4">
                 <div className="flex items-center justify-between pb-3 border-b border-[#f1ede4]">
                   <div>
-                    <h3 className="font-bold font-serif text-slate-900 text-sm sm:text-base">Arrivals today</h3>
-                    <p className="text-[11px] text-slate-500">Guests expected to arrive today at Moshi Urban Hostel</p>
+                    <h3 className="font-semibold text-slate-900 text-sm sm:text-base">Arrivals today</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500">Guests expected to arrive today at Moshi Urban Hostel</p>
                   </div>
                   <span className="text-xs font-semibold text-emerald-800 font-mono">
                     {arrivalsToday.length} arrivals
@@ -2812,15 +2812,15 @@ export default function App() {
                     >
                       <div>
                         <div className="flex items-center space-x-2">
-                          <span className="font-bold text-slate-900 text-xs sm:text-sm">{r.guestName}</span>
+                          <span className="font-semibold text-slate-900 text-xs sm:text-sm">{r.guestName}</span>
                           <span className="text-[11px] text-slate-400 font-mono">{r.id}</span>
-                          <span className="text-[11px] font-mono font-bold text-amber-900 bg-amber-50/80 px-1.5 py-0.5 rounded border border-amber-200/80">
+                          <span className="text-[11px] font-mono font-semibold text-amber-900 bg-amber-50/80 px-1.5 py-0.5 rounded border border-amber-200/80">
                             {r.unitId || r.bedCode}
                           </span>
                         </div>
-                        <p className="text-[11px] text-slate-500 mt-1">
+                        <p className="text-[11px] sm:text-xs text-slate-500 mt-1">
                           {r.room} <span aria-hidden="true">·</span> Phone: <span className="text-slate-700 font-mono">{r.phone || 'N/A'}</span> <span aria-hidden="true">·</span> Balance due:{' '}
-                          <strong className={r.balanceDue > 0 ? 'text-slate-900 font-bold' : 'text-slate-500'}>
+                          <strong className={r.balanceDue > 0 ? 'text-slate-900 font-semibold tabular-nums' : 'text-slate-500'}>
                             {formatMoney(r.balanceDue)}
                           </strong>
                         </p>
@@ -2834,7 +2834,7 @@ export default function App() {
                         ) : (
                           <button
                             onClick={() => handleCheckIn(r.id)}
-                            className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer"
+                            className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs rounded-xl shadow-xs transition flex items-center space-x-1.5 cursor-pointer min-h-[38px] sm:min-h-0"
                           >
                             <span>Check in</span>
                             <ArrowRight className="w-3.5 h-3.5" />
@@ -2853,8 +2853,8 @@ export default function App() {
               <div className="space-y-3">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                   <div>
-                    <h3 className="font-bold font-serif text-slate-900 text-base">Room & bed inventory tonight</h3>
-                    <p className="text-[11px] text-slate-400">Live bed-level status across all 4 rooms (16 beds total)</p>
+                    <h3 className="font-semibold text-slate-900 text-sm sm:text-base">Room & bed inventory tonight</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500">Live bed-level status across all 4 rooms (16 beds total)</p>
                   </div>
                   <div className="flex items-center space-x-3 text-[11px] text-slate-500 font-medium">
                     <span className="flex items-center space-x-1.5">
@@ -2885,16 +2885,16 @@ export default function App() {
                         <div className="flex items-start justify-between">
                           <div>
                             <div className="flex items-center space-x-2">
-                              <h4 className="font-bold font-serif text-slate-900 text-sm">{room.name}</h4>
+                              <h4 className="font-semibold text-slate-900 text-sm">{room.name}</h4>
                               <span className="text-[10px] text-slate-400 font-mono">{room.roomCode}</span>
                               <span className="text-[10px] bg-amber-50 text-amber-800 font-semibold px-2 py-0.5 rounded-full border border-amber-200">
                                 {freeCount} of {room.capacity} free
                               </span>
                             </div>
-                            <p className="text-[11px] text-slate-400 mt-0.5">{room.type}</p>
+                            <p className="text-[11px] text-slate-500 mt-0.5">{room.type}</p>
                           </div>
                           <div className="text-right">
-                            <span className="font-bold text-slate-900 font-serif text-sm">{formatMoney(room.rate)}</span>
+                            <span className="font-semibold text-slate-900 tabular-nums text-sm">{formatMoney(room.rate)}</span>
                             <p className="text-[9px] text-slate-400">≈ TZS 52,900 / night</p>
                           </div>
                         </div>
@@ -2915,7 +2915,7 @@ export default function App() {
                                   }`}
                                 >
                                   <div className="flex items-center justify-between">
-                                    <span className="font-mono font-bold text-slate-800 text-[10px]">{unit.id}</span>
+                                    <span className="font-mono font-semibold text-slate-800 text-[10px]">{unit.id}</span>
                                     <span
                                       className={`w-1.5 h-1.5 rounded-full ${
                                         isOccupied
@@ -2928,7 +2928,7 @@ export default function App() {
                                   </div>
                                   <div className="flex items-center justify-between mt-1 text-[10px]">
                                     <span className="text-slate-400 truncate">{unit.place}</span>
-                                    <span className={isOccupied ? 'font-bold text-amber-900 truncate' : 'text-slate-400'}>
+                                    <span className={isOccupied ? 'font-semibold text-amber-900 truncate' : 'text-slate-400'}>
                                       {occupant ? occupant.guestName.split(' ')[0] : 'Free'}
                                     </span>
                                   </div>
@@ -2938,7 +2938,7 @@ export default function App() {
                         </div>
 
                         <div className="flex items-center justify-between pt-2 border-t border-[#f1ede4] text-[11px]">
-                          <span className="text-slate-400 font-mono">{room.capacity} beds total</span>
+                          <span className="text-slate-500 font-mono">{room.capacity} beds total</span>
                           <button
                             onClick={() => handleOpenNewModal(`${room.name} (${room.roomCode})`)}
                             className="text-slate-700 hover:text-amber-800 font-semibold bg-[#faf8f5] hover:bg-slate-100 border border-[#e8e4dc] px-2.5 py-1 rounded-lg transition cursor-pointer"
@@ -2956,8 +2956,8 @@ export default function App() {
               <div className="bg-white rounded-2xl border border-[#e8e4dc] p-4 sm:p-5 shadow-2xs space-y-4">
                 <div className="flex items-center justify-between pb-3 border-b border-[#f1ede4]">
                   <div>
-                    <h3 className="font-bold font-serif text-slate-900 text-sm sm:text-base">Outstanding balances</h3>
-                    <p className="text-[11px] text-slate-500">
+                    <h3 className="font-semibold text-slate-900 text-sm sm:text-base">Outstanding balances</h3>
+                    <p className="text-[11px] sm:text-xs text-slate-500">
                       Folios pending collection upon check-in or stay completion
                     </p>
                   </div>
@@ -2971,19 +2971,19 @@ export default function App() {
                     <div key={r.id} className="py-3 sm:py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                       <div>
                         <div className="flex items-center space-x-2">
-                          <span className="font-bold text-slate-900 text-xs sm:text-sm">{r.guestName}</span>
+                          <span className="font-semibold text-slate-900 text-xs sm:text-sm">{r.guestName}</span>
                           <span className="text-[11px] text-slate-400 font-mono">{r.id}</span>
                           <span className="text-[11px] font-mono text-slate-600 bg-[#f6f3ed] px-1.5 py-0.5 rounded border border-[#e8e4dc]">
                             {r.unitId || r.bedCode}
                           </span>
                         </div>
-                        <p className="text-[11px] text-slate-500 mt-1">
+                        <p className="text-[11px] sm:text-xs text-slate-500 mt-1">
                           Dates: {r.checkIn} – {r.checkOut} <span aria-hidden="true">·</span> Status: <span className="font-medium text-slate-700">{r.status}</span>
                         </p>
                       </div>
                       <div className="flex items-center justify-between sm:justify-end space-x-4">
                         <div className="text-left sm:text-right">
-                          <div className="font-bold font-serif text-amber-900 text-sm">{formatMoney(r.balanceDue)}</div>
+                          <div className="font-semibold text-amber-900 tabular-nums text-sm">{formatMoney(r.balanceDue)}</div>
                           <div className="text-[10px] text-slate-400 font-mono">≈ TZS {(r.balanceDue * 2645).toLocaleString()}</div>
                         </div>
                         <button
@@ -3014,8 +3014,8 @@ export default function App() {
               {/* Header Title & Top Actions */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
-                  <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">Bookings</h1>
-                  <p className="text-xs text-slate-500 mt-0.5">
+                  <h1 className="text-2xl sm:text-3xl font-semibold text-slate-900 tracking-tight">Bookings</h1>
+                  <p className="text-xs sm:text-sm text-slate-500 mt-1">
                     Sort, multi-select, and execute batch status actions, record payments, and manage folios synchronized with Google Sheets & Firebase.
                   </p>
                 </div>
@@ -3730,7 +3730,7 @@ export default function App() {
                             </td>
                             <td className="py-3 px-4">
                               <div
-                                className={`font-bold font-serif ${
+                                className={`font-semibold tabular-nums ${
                                   r.balanceDue > 0 ? 'text-amber-800' : 'text-emerald-700'
                                 }`}
                               >
@@ -3828,7 +3828,7 @@ export default function App() {
               <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-white p-4 sm:p-5 rounded-2xl border border-[#e8e4dc] shadow-2xs">
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">Availability Calendar</h1>
+                    <h1 className="text-2xl sm:text-3xl font-semibold text-slate-900 tracking-tight">Availability Calendar</h1>
                     
                     {/* Compact Synchronization Indicator */}
                     <div className="relative">
@@ -3967,7 +3967,7 @@ export default function App() {
                   <div className="flex items-center space-x-1.5">
                     <button
                       onClick={handleCalendarPrev}
-                      className="p-1.5 border border-[#e8e4dc] rounded-xl hover:bg-slate-50 text-slate-600 transition cursor-pointer"
+                      className="w-11 h-11 sm:w-9 sm:h-9 flex items-center justify-center border border-[#e8e4dc] rounded-xl hover:bg-slate-50 text-slate-600 transition cursor-pointer touch-manipulation"
                       title={calendarView === 'month' ? 'Previous Month' : calendarView === 'day' ? 'Previous Day' : 'Previous 7 Days'}
                       aria-label="Previous Month"
                     >
@@ -3975,14 +3975,14 @@ export default function App() {
                     </button>
                     <button
                       onClick={handleCalendarToday}
-                      className="px-3 py-1.5 text-xs bg-[#faf8f5] hover:bg-amber-50 text-slate-800 hover:text-amber-950 font-bold border border-[#e8e4dc] hover:border-amber-300 rounded-xl transition cursor-pointer"
+                      className="min-h-[44px] sm:min-h-[36px] px-3.5 py-2 text-xs bg-[#faf8f5] hover:bg-amber-50 text-slate-800 hover:text-amber-950 font-bold border border-[#e8e4dc] hover:border-amber-300 rounded-xl transition cursor-pointer touch-manipulation flex items-center justify-center"
                       title="Jump to today's date"
                     >
                       Today
                     </button>
                     <button
                       onClick={handleCalendarNext}
-                      className="p-1.5 border border-[#e8e4dc] rounded-xl hover:bg-slate-50 text-slate-600 transition cursor-pointer"
+                      className="w-11 h-11 sm:w-9 sm:h-9 flex items-center justify-center border border-[#e8e4dc] rounded-xl hover:bg-slate-50 text-slate-600 transition cursor-pointer touch-manipulation"
                       title={calendarView === 'month' ? 'Next Month' : calendarView === 'day' ? 'Next Day' : 'Next 7 Days'}
                       aria-label="Next Month"
                     >
@@ -4026,18 +4026,20 @@ export default function App() {
                   <div className="xl:col-span-7 2xl:col-span-8 bg-white rounded-2xl border border-[#e8e4dc] p-2.5 sm:p-4 shadow-2xs space-y-3 min-w-0">
                     
                     {/* Calendar Month Header & Context */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-[#f0ede6]">
-                      <div className="flex items-center space-x-2">
-                        <span className="font-serif font-bold text-slate-900 text-base sm:text-lg">
-                          {currentCalendarDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
-                        </span>
-                        <span className="text-xs text-slate-500 font-mono">
-                          • {HOSTEL_ROOMS.reduce((s, r) => s + r.capacity, 0)} total beds across {HOSTEL_ROOMS.length} rooms
-                        </span>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 pb-2.5 border-b border-[#f0ede6]">
+                      <div>
+                        <div className="flex items-center space-x-2 flex-wrap">
+                          <span className="font-semibold text-slate-900 text-base sm:text-lg whitespace-nowrap">
+                            {currentCalendarDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                          </span>
+                          <span className="text-xs text-slate-500 font-mono">
+                            • {HOSTEL_ROOMS.reduce((s, r) => s + r.capacity, 0)} total beds across {HOSTEL_ROOMS.length} rooms
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Beds available: each cell shows open beds on that date
+                        </p>
                       </div>
-                      <span className="text-[11px] text-slate-500 font-medium">
-                        Beds available: each cell shows open beds on that date
-                      </span>
                     </div>
 
                     {/* Days of the Week Header */}
@@ -4071,7 +4073,7 @@ export default function App() {
                               key={cell.dateStr}
                               type="button"
                               onClick={() => setSelectedCalendarDate(cell.dateStr)}
-                              className={`min-w-0 w-full h-[88px] sm:h-[92px] p-1.5 rounded-xl border flex flex-col items-center justify-between text-center transition cursor-pointer relative box-border focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] ${
+                              className={`calendar-date-cell touch-manipulation min-w-0 w-full h-[88px] sm:h-[92px] p-1.5 rounded-xl border flex flex-col items-center justify-between text-center transition cursor-pointer relative box-border focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] ${
                                 isSelected
                                   ? 'border-slate-900 bg-amber-50/70 shadow-xs ring-1 ring-inset ring-slate-900'
                                   : cell.isToday
@@ -4084,7 +4086,7 @@ export default function App() {
                               aria-label={`${cell.dateStr}: ${cell.availableBedsCount} beds free${cell.isToday ? ', Today' : ''}`}
                             >
                               {/* 1. Date number at the top (15-16px) */}
-                              <div className="flex flex-col items-center justify-center pt-0.5 w-full min-w-0">
+                              <div className="relative z-10 pointer-events-none flex flex-col items-center justify-center pt-0.5 w-full min-w-0">
                                 <span
                                   className={`text-[15px] sm:text-base leading-none font-semibold ${
                                     cell.isToday
@@ -4101,7 +4103,7 @@ export default function App() {
                               </div>
 
                               {/* 2. Available quantity below it (13px) */}
-                              <div className="flex flex-col items-center justify-center my-auto w-full min-w-0">
+                              <div className="relative z-10 pointer-events-none flex flex-col items-center justify-center my-auto w-full min-w-0">
                                 <span
                                   className={`text-[13px] font-mono font-bold leading-tight ${
                                     cell.availableBedsCount === 0
@@ -4118,7 +4120,7 @@ export default function App() {
                               </div>
 
                               {/* 3. Small label saying "free" below the quantity (11-12px) */}
-                              <div className="flex flex-col items-center justify-center pb-0.5 w-full min-w-0">
+                              <div className="relative z-10 pointer-events-none flex flex-col items-center justify-center pb-0.5 w-full min-w-0">
                                 <span
                                   className={`text-[11px] font-medium leading-none ${
                                     cell.availableBedsCount === 0
@@ -4182,7 +4184,7 @@ export default function App() {
                       <div>
                         <div className="flex items-center space-x-2">
                           <CalendarDays className="w-4 h-4 text-[#fdbe4e]" />
-                          <h2 className="text-base font-bold font-serif text-slate-900 tracking-tight">
+                          <h2 className="text-base sm:text-lg font-semibold text-slate-900 tracking-tight">
                             {formatReadableHeading(selectedCalendarDate)}
                           </h2>
                           {selectedCalendarDate === realTodayStr && (
@@ -4474,12 +4476,12 @@ export default function App() {
                           {/* Room Header */}
                           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-[#f0ede6]">
                             <div className="flex items-center space-x-2.5">
-                              <div className="w-8 h-8 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center font-bold font-serif text-[#0d1726]">
+                              <div className="w-8 h-8 rounded-xl bg-amber-50 border border-amber-200 flex items-center justify-center font-semibold text-[#0d1726]">
                                 {room.name.charAt(0)}
                               </div>
                               <div>
                                 <div className="flex items-center space-x-2">
-                                  <h3 className="font-bold font-serif text-slate-900 text-sm">{room.name}</h3>
+                                  <h3 className="font-semibold text-slate-900 text-sm">{room.name}</h3>
                                   <span className="text-xs text-slate-400 font-mono">{room.roomCode}</span>
                                   <span className="text-xs text-slate-500">• {room.type}</span>
                                 </div>
@@ -4788,8 +4790,8 @@ export default function App() {
           {activeTab === 'rooms' && (
             <div className="space-y-5 animate-in fade-in duration-150">
               <div>
-                <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">Rooms & Units</h1>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <h1 className="text-2xl sm:text-3xl font-semibold text-slate-900 tracking-tight">Rooms & Units</h1>
+                <p className="text-xs sm:text-sm text-slate-500 mt-1">
                   Hostel room inventory breakdown with official bed identifiers matching your Moshi Urban spreadsheet setup.
                 </p>
               </div>
@@ -4800,18 +4802,18 @@ export default function App() {
                     <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
                       <div>
                         <div className="flex items-center space-x-2">
-                          <h3 className="font-bold font-serif text-slate-900 text-base">{room.name}</h3>
+                          <h3 className="font-semibold text-slate-900 text-base">{room.name}</h3>
                           <span className="text-xs text-slate-400 font-mono">{room.roomCode}</span>
                           <span className="text-xs text-slate-500 font-medium">
                             <span aria-hidden="true">·</span> {room.capacity} beds capacity
                           </span>
                         </div>
-                        <p className="text-xs text-slate-500 mt-1">{room.description}</p>
+                        <p className="text-xs sm:text-sm text-slate-500 mt-1">{room.description}</p>
                       </div>
 
                       <div className="flex items-center space-x-4">
                         <div className="text-right">
-                          <span className="font-bold font-serif text-slate-900 text-lg">{formatMoney(room.rate)}</span>
+                          <span className="font-semibold text-slate-900 tabular-nums text-lg">{formatMoney(room.rate)}</span>
                           <p className="text-[10px] text-slate-400">≈ TZS 52,900 / night</p>
                         </div>
                         <button
@@ -4848,10 +4850,10 @@ export default function App() {
           {activeTab === 'sheets' && (
             <div className="space-y-6 animate-in fade-in duration-150 max-w-4xl">
               <div>
-                <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">
+                <h1 className="text-2xl sm:text-3xl font-semibold text-slate-900 tracking-tight">
                   Cloud Database & Spreadsheet Integrations
                 </h1>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <p className="text-xs sm:text-sm text-slate-500 mt-1">
                   Synchronize your reservations across Firebase Firestore Cloud Database and your Google Sheets booking spreadsheet.
                 </p>
               </div>
@@ -4865,7 +4867,7 @@ export default function App() {
                     </div>
                     <div>
                       <div className="flex items-center space-x-2">
-                        <h3 className="font-bold text-sm text-slate-900 font-serif">Firebase Firestore Database</h3>
+                        <h3 className="font-semibold text-sm text-slate-900">Firebase Firestore Database</h3>
                         <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
                           <CheckCircle2 className="w-3 h-3 text-emerald-600" />
                           <span>Connected</span>
@@ -4922,7 +4924,7 @@ export default function App() {
                     </div>
                     <div>
                       <div className="flex items-center space-x-2">
-                        <h3 className="font-bold text-sm text-slate-900 font-serif">Admin Access Authorization</h3>
+                        <h3 className="font-semibold text-sm text-slate-900">Admin Access Authorization</h3>
                         {isAdmin ? (
                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
                             <CheckCircle2 className="w-3 h-3 text-emerald-600" />
@@ -4940,7 +4942,7 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      <p className="text-xs text-slate-400 mt-0.5">
+                      <p className="text-xs text-slate-500 mt-0.5">
                         Only authorized Google Administrator accounts are granted permission to create, edit, check-in, check-out, and delete bookings.
                       </p>
                     </div>
@@ -4986,7 +4988,7 @@ export default function App() {
                           : 'bg-[#faf8f5] border-[#ede9e1]'
                       }`}>
                         <div className="flex items-center justify-between mb-1">
-                          <span className="font-bold text-slate-900 text-xs">{acc.name}</span>
+                          <span className="font-semibold text-slate-900 text-xs">{acc.name}</span>
                           <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
                             isCurrent
                               ? 'bg-emerald-600 text-white'
@@ -4996,7 +4998,7 @@ export default function App() {
                           </span>
                         </div>
                         <div className="font-mono text-[11px] text-slate-700 truncate">{acc.email}</div>
-                        <div className="text-[10px] text-slate-400 mt-1">{acc.role}</div>
+                        <div className="text-[10px] text-slate-500 mt-1">{acc.role}</div>
                       </div>
                     );
                   })}
@@ -5011,7 +5013,7 @@ export default function App() {
                       <FileSpreadsheet className="w-6 h-6" />
                     </div>
                     <div>
-                      <h3 className="font-bold text-sm text-slate-900 font-serif">Google Workspace Account</h3>
+                      <h3 className="font-semibold text-sm text-slate-900">Google Workspace Account</h3>
                       <p className="text-xs text-slate-400">
                         {user
                           ? `Authenticated as ${user.displayName || user.email}`
@@ -5332,7 +5334,7 @@ export default function App() {
                       <Sparkles className="w-6 h-6 text-[#fdbe4e]" />
                     </div>
                     <div>
-                      <h3 className="font-bold text-sm text-slate-900 font-serif">
+                      <h3 className="font-semibold text-sm text-slate-900">
                         Google Sheet Cell Automations & Dropdowns
                       </h3>
                       <p className="text-xs text-slate-500 mt-0.5">
@@ -5385,7 +5387,7 @@ export default function App() {
 
               {/* Explanation of Direct 2-Way Architecture */}
               <div className="bg-white rounded-2xl border border-[#e8e4dc] p-6 shadow-2xs space-y-3">
-                <h3 className="font-bold text-sm text-slate-900 font-serif">
+                <h3 className="font-semibold text-sm text-slate-900">
                   Why this directly solves your previous synchronization problems:
                 </h3>
                 <ul className="text-xs text-slate-600 space-y-2 list-disc pl-4 leading-relaxed">
@@ -5423,7 +5425,7 @@ export default function App() {
                   </div>
                   <div>
                     <div className="flex items-center space-x-2">
-                      <h1 className="text-2xl font-bold font-serif text-slate-900 tracking-tight">Change Log</h1>
+                      <h1 className="text-2xl sm:text-3xl font-semibold text-slate-900 tracking-tight">Change Log</h1>
                       <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 text-[10px] font-bold border border-amber-300">
                         Past 3 Days
                       </span>
@@ -5619,7 +5621,7 @@ export default function App() {
                                 <span className={`px-2 py-0.5 rounded-md text-[9px] font-black tracking-wider uppercase border ${actionConfig.bg}`}>
                                   {actionConfig.label}
                                 </span>
-                                <h3 className="font-bold text-xs text-slate-900 font-serif">
+                                <h3 className="font-semibold text-xs sm:text-sm text-slate-900">
                                   {item.title}
                                 </h3>
                               </div>
@@ -5749,7 +5751,7 @@ export default function App() {
                   {isAdmin ? <ShieldCheck className="w-6 h-6 text-emerald-600" /> : <Lock className="w-6 h-6 text-amber-600" />}
                 </div>
                 <div>
-                  <h3 className="text-base font-bold font-serif text-slate-900">
+                  <h3 className="text-base font-semibold text-slate-900">
                     Administrator Authorization
                   </h3>
                   <p className="text-xs text-slate-500">
@@ -5923,7 +5925,7 @@ export default function App() {
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-[#e8e4dc] my-6 animate-in fade-in zoom-in-95 duration-200">
             <div className="flex items-center justify-between pb-3 border-b border-[#f1ede4]">
               <div>
-                <h3 className="text-base font-bold font-serif text-slate-900">
+                <h3 className="text-base sm:text-lg font-semibold text-slate-900">
                   {editingBooking ? `Edit Reservation (${formData.id})` : 'New Reservation'}
                 </h3>
                 <p className="text-xs text-slate-400">Writes directly to your Google Spreadsheet database</p>
@@ -6256,7 +6258,7 @@ export default function App() {
                 <CreditCard className="w-5 h-5" />
               </div>
               <div>
-                <h4 className="font-bold font-serif text-slate-900 text-sm">Collect Balance</h4>
+                <h4 className="font-semibold text-slate-900 text-sm">Collect Balance</h4>
                 <p className="text-xs text-slate-500">
                   {collectModalBooking.guestName} ({collectModalBooking.id})
                 </p>
@@ -6266,7 +6268,7 @@ export default function App() {
             <div className="bg-[#faf8f5] p-3 rounded-xl border border-[#ede9e1] my-4 space-y-1.5 text-xs">
               <div className="flex justify-between">
                 <span className="text-slate-500">Outstanding Balance:</span>
-                <span className="font-bold text-rose-600">${collectModalBooking.balanceDue}</span>
+                <span className="font-semibold tabular-nums text-rose-600">${collectModalBooking.balanceDue}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">Tanzanian Shilling (TZS):</span>
@@ -6304,7 +6306,7 @@ export default function App() {
               <div>
                 <div className="flex items-center space-x-2">
                   <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
-                  <h3 className="text-base font-bold font-serif text-slate-900">
+                  <h3 className="text-base font-semibold text-slate-900">
                     {selectedBookingInfo.roomName}
                   </h3>
                 </div>
@@ -6451,7 +6453,7 @@ export default function App() {
                   <Sparkles className="w-6 h-6" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold font-serif text-slate-900">
+                  <h3 className="text-base sm:text-lg font-semibold text-slate-900">
                     Google Sheets Smart Automations & Sync Engine
                   </h3>
                   <p className="text-xs text-slate-500">

@@ -158,6 +158,10 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
     console.warn('Skipping saveReservationToFirestore: user is not signed in.');
     return;
   }
+  if (!isAuthorizedAdminEmail(auth.currentUser.email)) {
+    console.warn('Skipping saveReservationToFirestore: user is not an authorized administrator.');
+    return;
+  }
   const path = `reservations/${res.id}`;
   try {
     const docRef = doc(db, 'reservations', res.id);
@@ -175,6 +179,10 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
     console.warn('Skipping deleteReservationFromFirestore: user is not signed in.');
     return;
   }
+  if (!isAuthorizedAdminEmail(auth.currentUser.email)) {
+    console.warn('Skipping deleteReservationFromFirestore: user is not an authorized administrator.');
+    return;
+  }
   const path = `reservations/${reservationId}`;
   try {
     const docRef = doc(db, 'reservations', reservationId);
@@ -188,6 +196,10 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
 export async function clearAllReservationsFromFirestore(): Promise<number> {
   if (!auth.currentUser) {
     console.warn('Skipping clearAllReservationsFromFirestore: user is not signed in.');
+    return 0;
+  }
+  if (!isAuthorizedAdminEmail(auth.currentUser.email)) {
+    console.warn('Skipping clearAllReservationsFromFirestore: user is not an authorized administrator.');
     return 0;
   }
   const path = 'reservations';

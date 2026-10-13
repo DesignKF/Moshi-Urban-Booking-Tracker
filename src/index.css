@@ -1,22 +1,155 @@
 @import "tailwindcss";
 
 @layer base {
-  body {
-    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    color: #1e293b;
-    background-color: #f8f6f0;
+  :root {
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    
+    /* Brand Navy & Gold Tokens */
+    --brand-navy-950: #080f1a;
+    --brand-navy-900: #0d1726;
+    --brand-navy-800: #152338;
+    --brand-gold-500: #d97706;
+    --brand-gold-400: #f59e0b;
+    --brand-gold-300: #fdbe4e;
+    --brand-gold-100: #fef3c7;
+    --brand-gold-50: #fffbeb;
+    
+    /* Canvas & Surface Tokens */
+    --surface-bg: #f8f6f0;
+    --surface-card: #ffffff;
+    --surface-subtle: #faf8f5;
+    --border-card: #e8e4dc;
+    --border-subtle: #f0ede6;
+    
+    /* Accessible Text Tokens */
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --text-tertiary: #64748b;
   }
 
-  h1, h2, h3, .font-serif {
-    font-family: 'Playfair Display', Georgia, serif;
+  html {
+    font-family: var(--font-sans);
+    color: var(--text-primary);
+    background-color: var(--surface-bg);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    color: var(--text-primary);
+    background-color: var(--surface-bg);
+    line-height: 1.5;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-sans);
+    color: var(--text-primary);
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.015em;
+  }
+
+  /* Strictly enforce clean system sans-serif across all headings and content */
+  .font-serif, [class*="font-serif"] {
+    font-family: var(--font-sans) !important;
   }
 
   code, pre, .font-mono {
-    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--font-mono);
+  }
+
+  input, select, textarea {
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.5;
   }
 }
 
-/* Custom Scrollbar for sleek UI feel */
+/* Operational Typography System Tokens */
+.page-title {
+  font-family: var(--font-sans);
+  font-size: 1.5rem; /* 24px mobile */
+  line-height: 1.25;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: #0f172a;
+}
+@media (min-width: 640px) {
+  .page-title {
+    font-size: 1.875rem; /* 30px desktop */
+    line-height: 1.2;
+  }
+}
+
+.section-heading {
+  font-family: var(--font-sans);
+  font-size: 1.125rem; /* 18px mobile */
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: #0f172a;
+}
+@media (min-width: 640px) {
+  .section-heading {
+    font-size: 1.25rem; /* 20px desktop */
+    line-height: 1.25;
+  }
+}
+
+.sub-heading {
+  font-family: var(--font-sans);
+  font-size: 0.9375rem; /* 15px */
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: #0f172a;
+}
+
+.body-default {
+  font-family: var(--font-sans);
+  font-size: 1rem; /* 16px */
+  line-height: 1.5;
+  font-weight: 400;
+  color: #1e293b;
+}
+
+.ui-label {
+  font-family: var(--font-sans);
+  font-size: 0.9375rem; /* 15px */
+  line-height: 1.4;
+  font-weight: 500;
+  color: #0f172a;
+}
+
+.metadata-text {
+  font-family: var(--font-sans);
+  font-size: 0.8125rem; /* 13px */
+  line-height: 1.4;
+  font-weight: 400;
+  color: #475569;
+}
+
+.calendar-label {
+  font-family: var(--font-sans);
+  font-size: 0.75rem; /* 12px */
+  line-height: 1.3;
+  font-weight: 500;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Accessible focus styling */
+:focus-visible {
+  outline: 2px solid #d97706;
+  outline-offset: 2px;
+}
+
+/* Custom Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -33,4 +166,27 @@
 
 ::-webkit-scrollbar-thumb:hover {
   background: #c3bcae;
+}
+
+/* Calendar Date Cell Touch Target (Apple Human Interface Guidelines 44x44px) */
+.calendar-date-cell {
+  position: relative;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Ensures the clickable target covers 100% of the cell container while expanding
+   the interactive hit area to at least 44px x 44px on mobile viewports without
+   increasing the grid column widths or total grid dimensions */
+.calendar-date-cell::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  min-width: 44px;
+  min-height: 44px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  z-index: 1;
 }
