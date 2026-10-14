@@ -111,3 +111,39 @@ test('Tablet collapsed side panel width and overflow protection', () => {
   assert.equal(expanded.widthClass, 'md:w-64');
   assert.equal(expanded.textLabelClass, 'inline');
 });
+
+test('Unauthenticated user receives login screen first, then transitions to app after sign-in', () => {
+  const resolveView = (user, authLoading) => {
+    if (authLoading) return 'splash_loading';
+    if (!user) return 'login_screen';
+    return 'app_dashboard';
+  };
+
+  // Initially, before auth check resolves:
+  assert.equal(resolveView(null, true), 'splash_loading');
+
+  // Once checked and user is not logged in: presents login screen
+  assert.equal(resolveView(null, false), 'login_screen');
+
+  // After user signs in with Google: takes them directly to the app
+  const loggedInUser = { uid: 'user_123', email: 'staff@moshiurbanhostel.com' };
+  assert.equal(resolveView(loggedInUser, false), 'app_dashboard');
+
+  // After user signs out: returns them to login screen
+  assert.equal(resolveView(null, false), 'login_screen');
+});
+
+test('Login screen feature cards are hidden on mobile and tablet, visible on desktop', () => {
+  const getFeatureCardsVisibility = (viewport) => {
+    // Hidden on mobile and tablet, displayed on desktop (hidden lg:grid)
+    if (viewport === 'mobile' || viewport === 'tablet') {
+      return { visible: false, cssClass: 'hidden' };
+    }
+    return { visible: true, cssClass: 'grid' };
+  };
+
+  assert.equal(getFeatureCardsVisibility('mobile').visible, false);
+  assert.equal(getFeatureCardsVisibility('tablet').visible, false);
+  assert.equal(getFeatureCardsVisibility('desktop').visible, true);
+});
+

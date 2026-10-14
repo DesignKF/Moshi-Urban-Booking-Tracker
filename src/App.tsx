@@ -22,10 +22,10 @@ import {
   recordUserProfile,
   AUTHORIZED_ADMIN_EMAILS,
   SYSTEM_ADMIN_EMAILS,
-  SYSTEM_PROPERTY_MANAGER_EMAILS,
   UserRoleType
 } from './firebase';
 import { AdminPanel } from './AdminPanel';
+import { LoginScreen } from './LoginScreen';
 import {
   BookingConflict,
   detectBookingConflicts,
@@ -163,6 +163,8 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [loginError, setLoginError] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   // Admin Authorization State & Modal
@@ -781,19 +783,32 @@ export default function App() {
 
   // Init Auth on Mount
   useEffect(() => {
+    const timer = setTimeout(() => {
+      setAuthLoading(false);
+    }, 2000);
+
     const unsubscribe = initAuth(
       (currentUser, accessToken) => {
+        clearTimeout(timer);
         setUser(currentUser);
         setToken(accessToken);
-        loadSpreadsheets(accessToken);
+        setAuthLoading(false);
+        if (accessToken) {
+          loadSpreadsheets(accessToken);
+        }
         recordUserProfile(currentUser).catch(err => console.warn('User profile sync note:', err));
       },
       () => {
+        clearTimeout(timer);
         setUser(null);
         setToken(null);
+        setAuthLoading(false);
       }
     );
-    return () => unsubscribe();
+    return () => {
+      clearTimeout(timer);
+      unsubscribe();
+    };
   }, []);
 
   // Validate Firestore Connection on boot & Subscribe to real-time reservations
@@ -838,12 +853,15 @@ export default function App() {
   // Google Sign-in Handler
   const handleSignIn = async () => {
     setIsSigningIn(true);
+    setLoginError(null);
     try {
       const res = await googleSignIn();
       if (res) {
         setUser(res.user);
         setToken(res.accessToken);
-        await loadSpreadsheets(res.accessToken);
+        if (res.accessToken) {
+          await loadSpreadsheets(res.accessToken);
+        }
         // Persist profile in Firestore and sync role
         recordUserProfile(res.user).catch(err => console.warn('User profile sync note:', err));
         await fetchUserAccountsFromFirestore().catch(() => {});
@@ -862,7 +880,9 @@ export default function App() {
       }
     } catch (err: any) {
       console.error('Sign in error:', err);
-      triggerToast(err.message || 'Failed to sign in with Google', 'error');
+      const msg = err.message || 'Failed to sign in with Google';
+      setLoginError(msg);
+      triggerToast(msg, 'error');
     } finally {
       setIsSigningIn(false);
     }
@@ -2433,9 +2453,65 @@ export default function App() {
       if (changeLogFilter === 'today') return itemYMD === todayYMD;
       if (changeLogFilter === 'yesterday') return itemYMD === yesterdayYMD;
       if (changeLogFilter === 'older') return itemYMD !== todayYMD && itemYMD !== yesterdayYMD;
-      return true;
     });
   }, [changeLogs, changeLogFilter]);
+
+  // 1. Initial auth state verification splash
+  if (authLoading) {
+    return (
+      <div className="min-h-screen w-full bg-[#0a111c] text-slate-100 flex flex-col items-center justify-center p-4 selection:bg-[#fdbe4e] selection:text-[#0d1726]">
+        <div className="flex flex-col items-center space-y-4">
+          <img
+            src="/moshi_urban_logo_horizontal_white.svg"
+            alt="Moshi Urban Hostel"
+            className="h-10 w-auto object-contain animate-pulse"
+          />
+          <div className="flex items-center space-x-2 text-xs text-amber-300 font-medium">
+            <div className="w-3.5 h-3.5 border-2 border-[#fdbe4e] border-t-transparent rounded-full animate-spin" />
+            <span>Loading Moshi Urban PMS...</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Unauthenticated user: Present login screen/panel first then take them to the app after
+  if (!user) {
+    return (
+      <>
+        {/* Toast Notification */}
+        {toast && (
+          <div className="fixed bottom-5 right-5 z-[80] animate-bounce duration-300 pointer-events-auto">
+            <div
+              className={`px-4 py-3 rounded-xl shadow-2xl text-xs font-semibold flex items-center space-x-2.5 ${
+                toast.type === 'success'
+                  ? 'bg-emerald-800 text-white'
+                  : toast.type === 'error'
+                  ? 'bg-rose-800 text-white'
+                  : toast.type === 'warning'
+                  ? 'bg-amber-700 text-white'
+                  : 'bg-[#0d1726] text-white'
+              }`}
+            >
+              {toast.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-300" />}
+              {toast.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-300" />}
+              {toast.type === 'warning' && <AlertTriangle className="w-4 h-4 text-amber-200" />}
+              {toast.type === 'info' && <Sparkles className="w-4 h-4 text-amber-300" />}
+              <span>{toast.message}</span>
+            </div>
+          </div>
+        )}
+
+        <LoginScreen
+          onSignIn={handleSignIn}
+          isSigningIn={isSigningIn}
+          error={loginError}
+          onClearError={() => setLoginError(null)}
+          firestoreConnected={Boolean(firestoreConnected)}
+        />
+      </>
+    );
+  }
 
   return (
     <div className="flex h-screen w-full bg-[#faf8f5] text-slate-800 font-sans antialiased overflow-hidden selection:bg-amber-100 selection:text-amber-900">

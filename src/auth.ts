@@ -32,7 +32,7 @@ export const clearAccessToken = () => {
 };
 
 export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
+  onAuthSuccess?: (user: User, token: string | null) => void,
   onAuthFailure?: () => void
 ) => {
   return onAuthStateChanged(auth, async (user: User | null) => {
@@ -52,9 +52,9 @@ export const initAuth = (
         cachedAccessToken = storedToken;
         if (onAuthSuccess) onAuthSuccess(user, storedToken);
       } else {
-        // Token is missing, untracked, or expired
+        // Workspace Sheets token is missing or expired, but Firebase user is authenticated
         clearAccessToken();
-        if (onAuthFailure) onAuthFailure();
+        if (onAuthSuccess) onAuthSuccess(user, null);
       }
     } else {
       clearAccessToken();
