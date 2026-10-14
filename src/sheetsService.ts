@@ -572,7 +572,7 @@ export function calculateRoomBedAvailability(
       availableBeds.push(wholeRoomBed);
     }
 
-    result[def.name] = {
+    const availabilityData: RoomBedAvailability = {
       roomName: def.name,
       totalCapacity: def.capacity,
       availableBedsCount: availableIndividualBeds.length,
@@ -581,6 +581,8 @@ export function calculateRoomBedAvailability(
       occupiedBeds: occupiedBedsList,
       isAvailable: availableIndividualBeds.length > 0,
     };
+    result[def.name] = availabilityData;
+    result[def.shortName] = availabilityData;
   });
 
   return result;

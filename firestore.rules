@@ -68,30 +68,78 @@ service cloud.firestore {
         && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 50));
     }
 
-    function isAdmin() {
+    function isValidUserRole(data) {
+      return data.keys().hasAll(['email', 'role'])
+        && data.email is string && data.email.size() <= 200
+        && data.role in ['admin', 'manager', 'staff']
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 150))
+        && (!('status' in data) || data.status in ['active', 'suspended'])
+        && (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 60))
+        && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 60))
+        && (!('updatedBy' in data) || (data.updatedBy is string && data.updatedBy.size() <= 200));
+    }
+
+    function isHardcodedAdmin() {
+      return isSignedIn() && request.auth.token.email in [
+        'wolfgodie@gmail.com',
+        'gdnjau@gmail.com',
+        'designkilifair@gmail.com'
+      ];
+    }
+
+    function isHardcodedPropertyManager() {
+      return isSignedIn() && request.auth.token.email == 'moshiurbanproperty@gmail.com';
+    }
+
+    function isDatabaseAdmin() {
       return isSignedIn() && (
-        request.auth.token.email in [
-          'wolfgodie@gmail.com',
-          'gdnjau@gmail.com',
-          'moshiurbanproperty@gmail.com',
-          'designkilifair@gmail.com'
-        ] || (
-          exists(/databases/$(database)/documents/users/$(request.auth.uid))
-          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
+          && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.role == 'admin'
+          && (!('status' in get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data)
+              || get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.status != 'suspended'))
+        || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+      );
+    }
+
+    function isAdmin() {
+      return isHardcodedAdmin() || isDatabaseAdmin();
+    }
+
+    function isPropertyManager() {
+      return isHardcodedPropertyManager() || (
+        isSignedIn() && (
+          (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
+            && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.role == 'manager'
+            && (!('status' in get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data)
+                || get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.status != 'suspended'))
+          || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'manager')
         )
       );
     }
 
-    // Reservations Collection - Publicly viewable hostel bookings & availability, editable only by authorized admins
+    function isPropertyManagerOrAdmin() {
+      return isAdmin() || isPropertyManager();
+    }
+
+    // Reservations Collection - Publicly viewable hostel bookings & availability, editable only by authorized Admins and Property Managers
     match /reservations/{reservationId} {
       allow get, list: if true;
-      allow create: if isAdmin()
+      allow create: if isPropertyManagerOrAdmin()
         && isValidId(reservationId)
         && isValidReservation(incoming());
-      allow update: if isAdmin()
+      allow update: if isPropertyManagerOrAdmin()
         && isValidId(reservationId)
         && isValidReservation(incoming());
-      allow delete: if isAdmin() && isValidId(reservationId);
+      allow delete: if isPropertyManagerOrAdmin() && isValidId(reservationId);
+    }
+
+    // User Roles Collection - Managed by administrators to grant or revoke app access
+    match /user_roles/{email} {
+      allow get, list: if isSignedIn();
+      allow create, update: if isAdmin() && isValidUserRole(incoming());
+      allow delete: if isAdmin();
     }
 
     // User Profiles Collection
@@ -99,10 +147,10 @@ service cloud.firestore {
       allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
       allow list: if isAdmin();
       allow create, update: if isSignedIn()
-        && request.auth.uid == userId
+        && (request.auth.uid == userId || isAdmin())
         && isValidId(userId)
         && isValidUserProfile(incoming());
-      allow delete: if false;
+      allow delete: if isAdmin();
     }
   }
 }

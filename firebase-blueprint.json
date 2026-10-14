@@ -146,6 +146,48 @@
         }
       },
       "required": ["uid", "email"]
+    },
+    "UserRole": {
+      "title": "UserRole",
+      "description": "Hostel PMS user account role and permissions mapping",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Staff or manager email address",
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "description": "Permission role level in PMS",
+          "enum": ["admin", "manager", "staff"],
+          "maxLength": 30
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Staff member full name or title",
+          "maxLength": 150
+        },
+        "status": {
+          "type": "string",
+          "description": "Account status",
+          "enum": ["active", "suspended"],
+          "maxLength": 30
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Created at timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last updated at timestamp"
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "Email of admin who created or modified this role"
+        }
+      },
+      "required": ["email", "role"]
     }
   },
   "firestore": {
@@ -160,6 +202,12 @@
         "$ref": "#/entities/UserProfile"
       },
       "description": "Hostel staff and manager user profiles"
+    },
+    "/user_roles/{email}": {
+      "schema": {
+        "$ref": "#/entities/UserRole"
+      },
+      "description": "Collection of assigned user roles and permission states"
     }
   }
 }

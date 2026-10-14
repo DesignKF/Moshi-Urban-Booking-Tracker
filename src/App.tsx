@@ -16,9 +16,21 @@ import {
   subscribeToReservations,
   fetchReservationsFromFirestore,
   isAuthorizedAdminEmail,
+  isAuthorizedPropertyManagerOrAdmin,
+  getUserRole,
+  fetchUserAccountsFromFirestore,
   recordUserProfile,
-  AUTHORIZED_ADMIN_EMAILS
+  AUTHORIZED_ADMIN_EMAILS,
+  SYSTEM_ADMIN_EMAILS,
+  SYSTEM_PROPERTY_MANAGER_EMAILS,
+  UserRoleType
 } from './firebase';
+import { AdminPanel } from './AdminPanel';
+import {
+  BookingConflict,
+  detectBookingConflicts,
+  checkNewBookingConflict
+} from './bookingConflicts';
 import {
   listUserSpreadsheets,
   getSpreadsheetDetails,
@@ -125,11 +137,26 @@ import {
   Eye,
   Wrench,
   PlayCircle,
-  Activity
+  Activity,
+  Coins,
+  Settings
 } from 'lucide-react';
 
 export type SortField = 'checkIn' | 'checkOut' | 'guestName' | 'id' | 'room' | 'status' | 'balanceDue' | 'totalAmount';
 export type SortDirection = 'asc' | 'desc';
+
+export interface RecentSearchEntry {
+  id: string;
+  query: string;
+  type: 'search' | 'guest_record';
+  timestamp: number;
+  bookingId?: string;
+  guestName?: string;
+  room?: string;
+  bedCode?: string;
+  dates?: string;
+  status?: string;
+}
 
 export default function App() {
   // Auth state
@@ -141,22 +168,72 @@ export default function App() {
   // Admin Authorization State & Modal
   const [isAdminAuthModalOpen, setIsAdminAuthModalOpen] = useState(false);
   const [adminAuthReason, setAdminAuthReason] = useState<string>('edit hostel bookings');
+  const [userRoleVersion, setUserRoleVersion] = useState(0);
 
-  // Verify if current user is an authorized administrator
-  const isAdmin = useMemo(() => {
-    return Boolean(user?.email && isAuthorizedAdminEmail(user.email));
+  // Load and cache user accounts on mount and whenever user auth state changes
+  useEffect(() => {
+    fetchUserAccountsFromFirestore()
+      .then(() => setUserRoleVersion(v => v + 1))
+      .catch(err => console.warn('User roles init note:', err));
   }, [user]);
 
-  // Authorization check guard for editing operations
+  // Determine current user's effective role
+  const currentUserRole: UserRoleType | 'viewer' = useMemo(() => {
+    return getUserRole(user?.email);
+  }, [user, userRoleVersion]);
+
+  // 1. Admin - Can control each and everything on the PWA
+  const isAdmin = useMemo(() => {
+    return currentUserRole === 'admin';
+  }, [currentUserRole]);
+
+  // 2. Property manager - Has access to only create, edit or delete bookings and undo changes
+  const isPropertyManager = useMemo(() => {
+    return currentUserRole === 'manager';
+  }, [currentUserRole]);
+
+  // 3. Staff - Can only see the overview & availability of the rooms
+  const isStaff = useMemo(() => {
+    return currentUserRole === 'staff';
+  }, [currentUserRole]);
+
+  // Permissions matrix
+  const canEditBookings = useMemo(() => {
+    return isAdmin || isPropertyManager;
+  }, [isAdmin, isPropertyManager]);
+
+  const canUndoChanges = useMemo(() => {
+    return isAdmin || isPropertyManager;
+  }, [isAdmin, isPropertyManager]);
+
+  const canAccessAdmin = useMemo(() => {
+    return isAdmin;
+  }, [isAdmin]);
+
+  // Authorization check guard for operations
   const checkAdminAuthorization = (actionDescription = 'edit bookings'): boolean => {
-    if (isAdmin) return true;
+    const isWipeOrAdminAction =
+      actionDescription.includes('wipe') ||
+      actionDescription.includes('admin') ||
+      actionDescription.includes('fresh start') ||
+      actionDescription.includes('sheets database');
+
+    if (isWipeOrAdminAction) {
+      if (isAdmin) return true;
+      setAdminAuthReason(actionDescription);
+      setIsAdminAuthModalOpen(true);
+      return false;
+    }
+
+    if (canEditBookings) return true;
+
     setAdminAuthReason(actionDescription);
     setIsAdminAuthModalOpen(true);
     return false;
   };
 
-  // Active Tab
-  const [activeTab, setActiveTab] = useState<'overview' | 'bookings' | 'availability' | 'rooms' | 'sheets' | 'changelog'>('overview');
+  // Active Tab: Overview, Bookings, Availability, Rooms, Sheets, Changelog, and Admin Panel
+  const [activeTab, setActiveTab] = useState<'overview' | 'bookings' | 'availability' | 'rooms' | 'sheets' | 'changelog' | 'admin'>('overview');
 
   // Reservations Data (Starts completely clean & fresh)
   const [reservations, setReservations] = useState<Reservation[]>(() => {
@@ -338,6 +415,105 @@ export default function App() {
     return localStorage.getItem('muh_sidebar_collapsed') === 'true';
   });
   const [globalSearch, setGlobalSearch] = useState('');
+  const [isMobileSearchOpen, setIsMobileSearchOpen] = useState(false);
+  const [isCurrencyModalOpen, setIsCurrencyModalOpen] = useState(false);
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
+  const searchContainerRef = useRef<HTMLDivElement>(null);
+
+  // Keyboard shortcut: Cmd+K / Ctrl+K opens search popup
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsMobileSearchOpen(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+  const [recentSearches, setRecentSearches] = useState<RecentSearchEntry[]>(() => {
+    try {
+      const saved = localStorage.getItem('muh_recent_searches_v1');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {
+      console.warn('Failed to parse recent searches:', e);
+    }
+    return [];
+  });
+
+  // Recent Searches Manager: saves searches and accessed guest records to localStorage
+  const addRecentSearch = useCallback((entry: {
+    query: string;
+    type?: 'search' | 'guest_record';
+    bookingId?: string;
+    guestName?: string;
+    room?: string;
+    bedCode?: string;
+    dates?: string;
+    status?: string;
+  }) => {
+    const trimmed = (entry.query || '').trim();
+    if (!trimmed && !entry.guestName) return;
+
+    setRecentSearches(prev => {
+      const filtered = prev.filter(item => {
+        if (entry.bookingId && item.bookingId === entry.bookingId) return false;
+        if (trimmed && item.query.toLowerCase() === trimmed.toLowerCase()) return false;
+        return true;
+      });
+
+      const newItem: RecentSearchEntry = {
+        id: `rs-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        query: trimmed || entry.guestName || '',
+        type: entry.type || (entry.bookingId ? 'guest_record' : 'search'),
+        timestamp: Date.now(),
+        bookingId: entry.bookingId,
+        guestName: entry.guestName,
+        room: entry.room,
+        bedCode: entry.bedCode,
+        dates: entry.dates,
+        status: entry.status
+      };
+
+      const updated = [newItem, ...filtered].slice(0, 8);
+      try {
+        localStorage.setItem('muh_recent_searches_v1', JSON.stringify(updated));
+      } catch (err) {
+        console.warn('Failed to store recent searches:', err);
+      }
+      return updated;
+    });
+  }, []);
+
+  const removeRecentSearch = useCallback((id: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setRecentSearches(prev => {
+      const updated = prev.filter(item => item.id !== id);
+      try {
+        localStorage.setItem('muh_recent_searches_v1', JSON.stringify(updated));
+      } catch (err) {}
+      return updated;
+    });
+  }, []);
+
+  const clearAllRecentSearches = useCallback((e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setRecentSearches([]);
+    try {
+      localStorage.removeItem('muh_recent_searches_v1');
+    } catch (err) {}
+  }, []);
+
+  // Close search dropdown on clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
+        setIsSearchFocused(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
 
   // Date Scope & Range Filters for Bookings
@@ -345,7 +521,15 @@ export default function App() {
   const [customStartDate, setCustomStartDate] = useState<string>('');
   const [customEndDate, setCustomEndDate] = useState<string>('');
 
-  const [currency, setCurrency] = useState<'USD' | 'TZS' | 'EUR' | 'GBP'>('USD');
+  const [currency, setCurrency] = useState<'USD' | 'TZS' | 'EUR' | 'GBP'>(() => {
+    try {
+      const saved = localStorage.getItem('muh_currency_preference');
+      if (saved === 'USD' || saved === 'TZS' || saved === 'EUR' || saved === 'GBP') return saved;
+    } catch {
+      // ignore
+    }
+    return 'USD';
+  });
   const CURRENCY_RATES = { USD: 1, TZS: 2645, EUR: 0.92, GBP: 0.79 };
 
   // Sorting & Batch Selection state for Bookings
@@ -476,6 +660,73 @@ export default function App() {
     );
   }, [reservations, formData.checkIn, formData.checkOut, editingBooking]);
 
+  // Booking conflicts detection across all active reservations in the system
+  const conflicts = useMemo(() => detectBookingConflicts(reservations), [reservations]);
+  const [isConflictModalOpen, setIsConflictModalOpen] = useState(false);
+  const [isConflictBannerDismissed, setIsConflictBannerDismissed] = useState(false);
+
+  // Available rooms for the booking form's dates (only rooms with free beds)
+  const availableRooms = useMemo(() => {
+    return HOSTEL_ROOMS.filter(room => {
+      const fullName = `${room.name} (${room.roomCode})`;
+      const avail = modalAvailability[fullName] || modalAvailability[room.name];
+      const freeCount = avail?.availableBedsCount ?? room.capacity;
+      return freeCount > 0;
+    });
+  }, [modalAvailability]);
+
+  // Real-time conflict check for candidate booking inside the booking modal
+  const formConflict = useMemo(() => {
+    if (!formData.checkIn || !formData.checkOut || !formData.room || !formData.bedCode) return null;
+    return checkNewBookingConflict(
+      {
+        id: editingBooking?.id,
+        room: formData.room,
+        bedCode: formData.bedCode,
+        checkIn: formData.checkIn,
+        checkOut: formData.checkOut,
+        guestName: formData.guestName
+      },
+      reservations,
+      editingBooking?.id
+    );
+  }, [formData.checkIn, formData.checkOut, formData.room, formData.bedCode, formData.guestName, reservations, editingBooking]);
+
+  // Auto-reconcile room & bed in booking form when dates change to ensure only available options are selected
+  useEffect(() => {
+    if (!isBookingModalOpen) return;
+    if (!formData.checkIn || !formData.checkOut) return;
+
+    if (availableRooms.length === 0) {
+      // Entire hostel is full for these dates; alert is rendered in the form UI
+      return;
+    }
+
+    // Check if currently selected room is in availableRooms
+    const isCurrentRoomAvailable = availableRooms.some(
+      r => formData.room.includes(r.name) || formData.room === `${r.name} (${r.roomCode})`
+    );
+
+    let activeRoomName = formData.room;
+    if (!isCurrentRoomAvailable) {
+      const firstAvail = availableRooms[0];
+      activeRoomName = `${firstAvail.name} (${firstAvail.roomCode})`;
+    }
+
+    const avail = modalAvailability[activeRoomName];
+    const availBeds = avail?.availableBeds || [];
+    const isCurrentBedAvailable = availBeds.some(b => b.id === formData.bedCode);
+
+    if (!isCurrentRoomAvailable || !isCurrentBedAvailable) {
+      const fallbackBed = availBeds[0]?.id || '';
+      setFormData(prev => ({
+        ...prev,
+        room: activeRoomName,
+        bedCode: fallbackBed
+      }));
+    }
+  }, [formData.checkIn, formData.checkOut, availableRooms, modalAvailability, isBookingModalOpen]);
+
   // Save to LocalStorage whenever reservations change
   useEffect(() => {
     localStorage.setItem('muh_reservations_db', JSON.stringify(reservations));
@@ -595,12 +846,18 @@ export default function App() {
         await loadSpreadsheets(res.accessToken);
         // Persist profile in Firestore and sync role
         recordUserProfile(res.user).catch(err => console.warn('User profile sync note:', err));
-        const userIsAdmin = isAuthorizedAdminEmail(res.user.email);
-        if (userIsAdmin) {
-          triggerToast(`Admin access authorized for ${res.user.displayName || res.user.email}! Full booking editing enabled.`, 'success');
+        await fetchUserAccountsFromFirestore().catch(() => {});
+        setUserRoleVersion(v => v + 1);
+
+        const role = getUserRole(res.user.email);
+        if (role === 'admin') {
+          triggerToast(`Admin access authorized for ${res.user.displayName || res.user.email}! Full system control and Admin Panel enabled.`, 'success');
+          setIsAdminAuthModalOpen(false);
+        } else if (role === 'manager') {
+          triggerToast(`Signed in as Property Manager (${res.user.displayName || res.user.email}). Booking operations and Change Log enabled.`, 'success');
           setIsAdminAuthModalOpen(false);
         } else {
-          triggerToast(`Signed in as ${res.user.displayName || res.user.email} (View-only staff). Admin authorization required to edit bookings.`, 'info');
+          triggerToast(`Signed in as ${res.user.displayName || res.user.email} (Staff). View-only access to Room Overview & Availability enabled.`, 'info');
         }
       }
     } catch (err: any) {
@@ -1077,8 +1334,8 @@ export default function App() {
   };
 
   // Toast notification helper
-  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
-  const triggerToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' | 'warning' } | null>(null);
+  const triggerToast = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
     setToast({ message, type });
     setTimeout(() => {
       setToast(null);
@@ -1088,18 +1345,27 @@ export default function App() {
   // Handle open New Reservation modal
   const handleOpenNewModal = (prefillRoom?: string, prefillDate?: string) => {
     if (!checkAdminAuthorization('create new bookings')) return;
-    const roomObj = prefillRoom
-      ? HOSTEL_ROOMS.find(r => prefillRoom.includes(r.name) || r.name.toLowerCase() === prefillRoom.toLowerCase()) || HOSTEL_ROOMS[0]
-      : HOSTEL_ROOMS[0];
-    const targetRoom = `${roomObj.name} (${roomObj.roomCode})`;
-    const defaultUnit = roomObj.units[0]?.id || 'M-S1';
-
     // Current day as default check-in date
     const todayStr = new Date().toISOString().split('T')[0];
     const checkIn = prefillDate || todayStr;
     const nextDate = new Date(checkIn);
     nextDate.setDate(nextDate.getDate() + 3);
     const checkOut = nextDate.toISOString().split('T')[0];
+
+    // Find available rooms for these initial dates to avoid initial conflicts
+    const initAvail = calculateRoomBedAvailability(reservations, checkIn, checkOut);
+    const freeRooms = HOSTEL_ROOMS.filter(r => {
+      const fullName = `${r.name} (${r.roomCode})`;
+      const av = initAvail[fullName] || initAvail[r.name];
+      return (av?.availableBedsCount ?? r.capacity) > 0;
+    });
+
+    const roomObj = prefillRoom
+      ? HOSTEL_ROOMS.find(r => prefillRoom.includes(r.name) || r.name.toLowerCase() === prefillRoom.toLowerCase()) || freeRooms[0] || HOSTEL_ROOMS[0]
+      : freeRooms[0] || HOSTEL_ROOMS[0];
+    const targetRoom = `${roomObj.name} (${roomObj.roomCode})`;
+    const targetAvail = initAvail[targetRoom] || initAvail[roomObj.name];
+    const defaultUnit = targetAvail?.availableBeds[0]?.id || roomObj.units[0]?.id || 'M-S1';
 
     // Find highest existing MU ID number
     let maxIdNum = 0;
@@ -1160,6 +1426,18 @@ export default function App() {
 
   // Handle Edit Reservation modal
   const handleOpenEditModal = (r: Reservation) => {
+    // Record in recent searches for fast staff access to frequently viewed records
+    addRecentSearch({
+      query: r.guestName,
+      type: 'guest_record',
+      bookingId: r.id,
+      guestName: r.guestName,
+      room: r.room,
+      bedCode: r.unitId || r.bedCode,
+      dates: `${r.checkIn} to ${r.checkOut}`,
+      status: r.status
+    });
+
     if (!checkAdminAuthorization('edit booking details')) return;
     setEditingBooking(r);
 
@@ -1200,6 +1478,16 @@ export default function App() {
 
     if (!formData.guestName.trim()) {
       triggerToast('Please provide a guest name', 'error');
+      return;
+    }
+
+    if (formConflict) {
+      triggerToast(`Booking Conflict: ${formConflict.description}`, 'error');
+      return;
+    }
+
+    if (availableRooms.length === 0) {
+      triggerToast('Cannot save booking: All rooms are fully booked for selected dates.', 'error');
       return;
     }
 
@@ -1605,6 +1893,18 @@ export default function App() {
     };
   }, [reservations, getTodayStr]);
 
+  // Live matching reservations for the global search bar dropdown
+  const matchingReservations = useMemo(() => {
+    if (!globalSearch.trim()) return [];
+    const q = globalSearch.toLowerCase().trim();
+    return reservations
+      .filter(r => {
+        const text = `${r.id} ${r.guestName} ${r.phone} ${r.room} ${r.unitId} ${r.bedCode} ${r.email || ''}`.toLowerCase();
+        return text.includes(q);
+      })
+      .slice(0, 5);
+  }, [globalSearch, reservations]);
+
   // Filtered and sorted reservations for the bookings tab
   const filteredBookings = useMemo(() => {
     const today = getTodayStr();
@@ -1973,6 +2273,18 @@ export default function App() {
     booking?: Reservation;
   }[] = [];
 
+  // 0. Active Booking Conflicts (Critical priority)
+  conflicts.forEach(c => {
+    actionItems.unshift({
+      id: `conflict-${c.id}`,
+      type: 'mismatch',
+      title: `Conflict: ${c.title}`,
+      description: c.description,
+      severity: 'high',
+      booking: c.reservationA
+    });
+  });
+
   // 1. Room / bed mismatch detection (e.g., Bed doesn't match selected room)
   reservations.forEach(r => {
     const roomPrefix = r.room.toLowerCase().includes('mawenzi') ? 'M'
@@ -2137,11 +2449,14 @@ export default function App() {
                 ? 'bg-emerald-800 text-white'
                 : toast.type === 'error'
                 ? 'bg-rose-800 text-white'
+                : toast.type === 'warning'
+                ? 'bg-amber-700 text-white'
                 : 'bg-[#0d1726] text-white'
             }`}
           >
             {toast.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-300" />}
             {toast.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-300" />}
+            {toast.type === 'warning' && <AlertTriangle className="w-4 h-4 text-amber-200" />}
             {toast.type === 'info' && <Sparkles className="w-4 h-4 text-amber-300" />}
             <span>{toast.message}</span>
           </div>
@@ -2189,40 +2504,45 @@ export default function App() {
       )}
 
       <aside
-        className={`${
-          sidebarCollapsed ? 'md:w-14' : 'md:w-64'
+        className={`fixed md:relative inset-y-0 left-0 z-50 ${
+          sidebarCollapsed ? 'w-64 md:w-16' : 'w-64 md:w-64'
         } ${
           mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
-        } fixed md:static inset-y-0 left-0 z-50 w-64 bg-[#0d1726] text-slate-300 flex flex-col shrink-0 border-r border-[#19263b] select-none transition-all duration-300 ease-in-out`}
+        } bg-[#0d1726] text-slate-300 flex flex-col shrink-0 border-r border-[#19263b] select-none transition-all duration-300 ease-in-out`}
       >
         {/* Brand Header */}
-        <div className={`p-4 border-b border-[#1b2a41] flex items-center ${sidebarCollapsed ? 'md:justify-center md:p-3' : 'justify-between'} min-h-[68px]`}>
-          {(!sidebarCollapsed || mobileSidebarOpen) ? (
-            <div className="flex items-center space-x-2.5 overflow-hidden">
-              <img
-                src="/moshi_urban_logo_horizontal_white.svg"
-                alt="Moshi Urban Hostel & Backpackers"
-                className="h-10 w-auto object-contain max-w-[170px]"
-              />
-              <span className="bg-[#fdbe4e]/25 text-[#fdbe4e] text-[9px] font-bold px-1.5 py-0.5 rounded border border-[#fdbe4e]/50 shrink-0">
-                PMS
-              </span>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center group relative cursor-pointer" onClick={() => {
-              setSidebarCollapsed(false);
-              localStorage.setItem('muh_sidebar_collapsed', 'false');
-            }} title="Moshi Urban Hostel PMS (Click to expand)">
+        <div className={`relative p-4 border-b border-[#1b2a41] flex items-center ${sidebarCollapsed ? 'md:justify-center md:p-3' : 'justify-between'} min-h-[68px]`}>
+          <div className={`${sidebarCollapsed ? 'md:hidden' : 'flex'} items-center space-x-2.5 overflow-hidden`}>
+            <img
+              src="/moshi_urban_logo_horizontal_white.svg"
+              alt="Moshi Urban Hostel & Backpackers"
+              className="h-9 w-auto object-contain max-w-[160px]"
+            />
+            <span className="bg-[#fdbe4e]/25 text-[#fdbe4e] text-[9px] font-bold px-1.5 py-0.5 rounded border border-[#fdbe4e]/50 shrink-0">
+              PMS
+            </span>
+          </div>
+
+          {sidebarCollapsed && (
+            <div
+              className="hidden md:flex flex-col items-center justify-center group cursor-pointer"
+              onClick={() => {
+                setSidebarCollapsed(false);
+                localStorage.setItem('muh_sidebar_collapsed', 'false');
+              }}
+              title="Moshi Urban Hostel PMS (Click to expand)"
+            >
               <img
                 src="/favicon.svg"
                 alt="Moshi Urban"
-                className="w-7 h-7 object-contain hover:scale-110 transition-transform"
+                className="w-7 h-7 object-contain group-hover:scale-110 transition-transform"
               />
             </div>
           )}
 
-          {/* Desktop Collapse/Expand Toggle Button */}
+          {/* Desktop / Tablet Collapse Toggle Button */}
           <button
+            type="button"
             onClick={() => {
               setSidebarCollapsed(prev => {
                 const next = !prev;
@@ -2231,11 +2551,12 @@ export default function App() {
               });
             }}
             title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            className={`hidden md:flex ${
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            className={`hidden md:flex items-center justify-center transition z-20 cursor-pointer ${
               sidebarCollapsed
-                ? 'absolute -right-3 top-5 bg-[#fdbe4e] text-[#0d1726] shadow-md hover:bg-[#ebb043] w-6 h-6 rounded-full'
+                ? 'absolute -right-3 top-5 bg-[#fdbe4e] text-[#0d1726] shadow-md hover:bg-[#ebb043] w-6 h-6 rounded-full ring-2 ring-[#0d1726]'
                 : 'text-slate-400 hover:text-white hover:bg-[#1a283f] p-1.5 rounded-lg'
-            } transition z-20 cursor-pointer items-center justify-center`}
+            }`}
           >
             {sidebarCollapsed ? (
               <ChevronRight className="w-3.5 h-3.5 stroke-[2.5]" />
@@ -2246,16 +2567,20 @@ export default function App() {
 
           {/* Mobile Close Button */}
           <button
+            type="button"
             onClick={() => setMobileSidebarOpen(false)}
             className="md:hidden text-slate-400 hover:text-white p-1 rounded-lg"
+            title="Close menu"
+            aria-label="Close menu"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {/* Navigation Items */}
-        <nav className={`${sidebarCollapsed ? 'md:px-1.5 md:py-3' : 'p-3'} space-y-1.5 flex-1 text-xs font-medium`}>
+        <nav className={`${sidebarCollapsed ? 'md:px-2 md:py-3' : 'p-3'} space-y-1.5 flex-1 overflow-y-auto overflow-x-hidden text-xs font-medium`}>
           <button
+            type="button"
             onClick={() => {
               setActiveTab('overview');
               setMobileSidebarOpen(false);
@@ -2271,42 +2596,48 @@ export default function App() {
           >
             <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
               <Layers className={`w-5 h-5 shrink-0 ${activeTab === 'overview' ? 'text-[#fdbe4e]' : 'text-slate-400 group-hover:text-white'}`} />
-              {(!sidebarCollapsed || mobileSidebarOpen) && <span>Overview</span>}
+              <span className={sidebarCollapsed ? 'md:hidden' : ''}>Overview</span>
             </div>
-            {(!sidebarCollapsed || mobileSidebarOpen) && arrivalsToday.length > 0 && (
-              <span className="w-5 h-5 rounded-full bg-[#fdbe4e] text-[#0d1726] font-bold text-[10px] flex items-center justify-center">
+            {arrivalsToday.length > 0 && (
+              <span className={`w-5 h-5 rounded-full bg-[#fdbe4e] text-[#0d1726] font-bold text-[10px] flex items-center justify-center ${sidebarCollapsed ? 'md:hidden' : ''}`}>
                 {arrivalsToday.length}
               </span>
             )}
-            {sidebarCollapsed && !mobileSidebarOpen && arrivalsToday.length > 0 && (
-              <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-[#fdbe4e] ring-2 ring-[#0d1726]" />
+            {sidebarCollapsed && arrivalsToday.length > 0 && (
+              <span className="hidden md:block absolute top-1 right-1 w-2 h-2 rounded-full bg-[#fdbe4e] ring-2 ring-[#0d1726]" />
             )}
           </button>
 
-          <button
-            onClick={() => {
-              setActiveTab('bookings');
-              setMobileSidebarOpen(false);
-            }}
-            title="Bookings"
-            className={`w-full flex items-center ${
-              sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
-            } rounded-xl transition cursor-pointer relative group ${
-              activeTab === 'bookings'
-                ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
-                : 'text-slate-400 hover:text-white hover:bg-[#132035]'
-            }`}
-          >
-            <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
-              <Calendar className={`w-5 h-5 shrink-0 ${activeTab === 'bookings' ? 'text-[#fdbe4e]' : 'text-slate-400 group-hover:text-white'}`} />
-              {(!sidebarCollapsed || mobileSidebarOpen) && <span>Bookings</span>}
-            </div>
-            {(!sidebarCollapsed || mobileSidebarOpen) && (
-              <span className="text-[10px] font-mono text-slate-500">{reservations.length}</span>
-            )}
-          </button>
+          {/* Bookings Tab (Hidden from Staff view-only accounts) */}
+          {!isStaff && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('bookings');
+                setMobileSidebarOpen(false);
+              }}
+              title="Bookings"
+              className={`w-full flex items-center ${
+                sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
+              } rounded-xl transition cursor-pointer relative group ${
+                activeTab === 'bookings'
+                  ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
+                  : 'text-slate-400 hover:text-white hover:bg-[#132035]'
+              }`}
+            >
+              <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
+                <Calendar className={`w-5 h-5 shrink-0 ${activeTab === 'bookings' ? 'text-[#fdbe4e]' : 'text-slate-400 group-hover:text-white'}`} />
+                <span className={sidebarCollapsed ? 'md:hidden' : ''}>Bookings</span>
+              </div>
+              <span className={`text-[10px] font-mono text-slate-500 ${sidebarCollapsed ? 'md:hidden' : ''}`}>
+                {reservations.length}
+              </span>
+            </button>
+          )}
 
+          {/* Availability Tab (Visible to all roles including Staff) */}
           <button
+            type="button"
             onClick={() => {
               setActiveTab('availability');
               setMobileSidebarOpen(false);
@@ -2322,93 +2653,156 @@ export default function App() {
           >
             <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
               <Bed className={`w-5 h-5 shrink-0 ${activeTab === 'availability' ? 'text-[#fdbe4e]' : 'text-slate-400 group-hover:text-white'}`} />
-              {(!sidebarCollapsed || mobileSidebarOpen) && <span>Availability</span>}
+              <span className={sidebarCollapsed ? 'md:hidden' : ''}>Availability</span>
             </div>
           </button>
 
-          <button
-            onClick={() => {
-              setActiveTab('rooms');
-              setMobileSidebarOpen(false);
-            }}
-            title="Rooms & Units"
-            className={`w-full flex items-center ${
-              sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
-            } rounded-xl transition cursor-pointer group ${
-              activeTab === 'rooms'
-                ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
-                : 'text-slate-400 hover:text-white hover:bg-[#132035]'
-            }`}
-          >
-            <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
-              <Building2 className={`w-5 h-5 shrink-0 ${activeTab === 'rooms' ? 'text-[#fdbe4e]' : 'text-slate-400 group-hover:text-white'}`} />
-              {(!sidebarCollapsed || mobileSidebarOpen) && <span>Rooms & Units</span>}
-            </div>
-          </button>
+          {/* Rooms & Units (Visible to Admins and Property Managers) */}
+          {!isStaff && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('rooms');
+                setMobileSidebarOpen(false);
+              }}
+              title="Rooms & Units"
+              className={`w-full flex items-center ${
+                sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
+              } rounded-xl transition cursor-pointer group ${
+                activeTab === 'rooms'
+                  ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
+                  : 'text-slate-400 hover:text-white hover:bg-[#132035]'
+              }`}
+            >
+              <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
+                <Building2 className={`w-5 h-5 shrink-0 ${activeTab === 'rooms' ? 'text-[#fdbe4e]' : 'text-slate-400 group-hover:text-white'}`} />
+                <span className={sidebarCollapsed ? 'md:hidden' : ''}>Rooms & Units</span>
+              </div>
+            </button>
+          )}
 
-          <button
-            onClick={() => {
-              setActiveTab('sheets');
-              setMobileSidebarOpen(false);
-            }}
-            title="Spreadsheet Database"
-            className={`w-full flex items-center ${
-              sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
-            } rounded-xl transition cursor-pointer relative group ${
-              activeTab === 'sheets'
-                ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
-                : 'text-slate-400 hover:text-white hover:bg-[#132035]'
-            }`}
-          >
-            <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
-              <FileSpreadsheet className={`w-5 h-5 shrink-0 ${activeTab === 'sheets' ? 'text-[#fdbe4e]' : 'text-emerald-400'}`} />
-              {(!sidebarCollapsed || mobileSidebarOpen) && <span>Spreadsheet Database</span>}
-            </div>
-            {(!sidebarCollapsed || mobileSidebarOpen) && (
+          {/* Spreadsheet Database (Admin Only) */}
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('sheets');
+                setMobileSidebarOpen(false);
+              }}
+              title="Spreadsheet Database"
+              className={`w-full flex items-center ${
+                sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
+              } rounded-xl transition cursor-pointer relative group ${
+                activeTab === 'sheets'
+                  ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
+                  : 'text-slate-400 hover:text-white hover:bg-[#132035]'
+              }`}
+            >
+              <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
+                <FileSpreadsheet className={`w-5 h-5 shrink-0 ${activeTab === 'sheets' ? 'text-[#fdbe4e]' : 'text-emerald-400'}`} />
+                <span className={sidebarCollapsed ? 'md:hidden' : ''}>Spreadsheet Database</span>
+              </div>
               <span
                 className={`w-2 h-2 rounded-full ${
                   user ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
-                }`}
+                } ${sidebarCollapsed ? 'md:hidden' : ''}`}
               />
-            )}
-            {sidebarCollapsed && !mobileSidebarOpen && (
-              <span
-                className={`absolute top-1.5 right-1.5 w-2 h-2 rounded-full ${
-                  user ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
-                }`}
-              />
-            )}
-          </button>
+              {sidebarCollapsed && (
+                <span
+                  className={`hidden md:block absolute top-1.5 right-1.5 w-2 h-2 rounded-full ${
+                    user ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                  }`}
+                />
+              )}
+            </button>
+          )}
 
-          {/* Change Log Item (Past 3 Days) - Like Elementor Change Log */}
-          <button
-            onClick={() => {
-              setActiveTab('changelog');
-              setMobileSidebarOpen(false);
-            }}
-            title="Change Log (Past 3 Days)"
-            className={`w-full flex items-center ${
-              sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
-            } rounded-xl transition cursor-pointer relative group ${
-              activeTab === 'changelog'
-                ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
-                : 'text-slate-400 hover:text-white hover:bg-[#132035]'
-            }`}
-          >
-            <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
-              <History className={`w-5 h-5 shrink-0 ${activeTab === 'changelog' ? 'text-[#fdbe4e]' : 'text-amber-400 group-hover:text-white'}`} />
-              {(!sidebarCollapsed || mobileSidebarOpen) && <span>Change Log</span>}
-            </div>
-            {(!sidebarCollapsed || mobileSidebarOpen) && (
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-[#fdbe4e] font-bold">
+          {/* Change Log Item (Admins & Property Managers) */}
+          {!isStaff && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('changelog');
+                setMobileSidebarOpen(false);
+              }}
+              title="Change Log (Past 3 Days)"
+              className={`w-full flex items-center ${
+                sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
+              } rounded-xl transition cursor-pointer relative group ${
+                activeTab === 'changelog'
+                  ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
+                  : 'text-slate-400 hover:text-white hover:bg-[#132035]'
+              }`}
+            >
+              <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
+                <History className={`w-5 h-5 shrink-0 ${activeTab === 'changelog' ? 'text-[#fdbe4e]' : 'text-amber-400 group-hover:text-white'}`} />
+                <span className={sidebarCollapsed ? 'md:hidden' : ''}>Change Log</span>
+              </div>
+              <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-[#fdbe4e] font-bold ${sidebarCollapsed ? 'md:hidden' : ''}`}>
                 {changeLogs.length}
               </span>
-            )}
-            {sidebarCollapsed && !mobileSidebarOpen && (
-              <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#fdbe4e]" />
-            )}
-          </button>
+              {sidebarCollapsed && (
+                <span className="hidden md:block absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#fdbe4e]" />
+              )}
+            </button>
+          )}
+
+          {/* Admin Panel (Admin Only) */}
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('admin');
+                setMobileSidebarOpen(false);
+              }}
+              title="Admin Panel & Team Permissions"
+              className={`w-full flex items-center ${
+                sidebarCollapsed ? 'md:justify-center md:h-10 md:w-10 md:mx-auto md:p-0 justify-between px-3.5 py-2.5' : 'justify-between px-3.5 py-2.5'
+              } rounded-xl transition cursor-pointer relative group ${
+                activeTab === 'admin'
+                  ? 'text-white bg-[#19273f] font-semibold border-l-2 md:border-l-0 md:ring-1 md:ring-[#fdbe4e]/60 border-[#fdbe4e]'
+                  : 'text-slate-400 hover:text-white hover:bg-[#132035]'
+              }`}
+            >
+              <div className={`flex items-center ${sidebarCollapsed ? 'md:justify-center' : 'space-x-3'}`}>
+                <ShieldCheck className={`w-5 h-5 shrink-0 ${activeTab === 'admin' ? 'text-[#fdbe4e]' : 'text-amber-400 group-hover:text-white'}`} />
+                <span className={sidebarCollapsed ? 'md:hidden' : ''}>Admin Panel</span>
+              </div>
+              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded bg-[#fdbe4e]/20 text-[#fdbe4e] ${sidebarCollapsed ? 'md:hidden' : ''}`}>
+                Admin
+              </span>
+            </button>
+          )}
         </nav>
+
+        {/* Currency in Side Panel (Mobile only - hidden on desktop view) */}
+        <div className="md:hidden p-3 border-t border-[#1b2a41] bg-[#0b1524]">
+          <button
+            type="button"
+            onClick={() => setIsCurrencyModalOpen(true)}
+            title="Change Currency (Opens currency selector)"
+            aria-label="Change Currency"
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-[#132034] hover:bg-[#1a2b44] text-slate-200 hover:text-white transition cursor-pointer border border-[#1f3350] group"
+          >
+            <div className="flex items-center space-x-2.5">
+              <div className="w-7 h-7 rounded-lg bg-[#fdbe4e]/20 text-[#fdbe4e] flex items-center justify-center shrink-0 border border-[#fdbe4e]/30 group-hover:scale-105 transition-transform">
+                <Coins className="w-4 h-4 text-[#fdbe4e]" />
+              </div>
+              <div className="text-left">
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-xs font-semibold text-white">Currency</span>
+                  <span className="text-[10px] font-mono font-bold text-[#fdbe4e] bg-[#fdbe4e]/20 px-1.5 py-0.2 rounded border border-[#fdbe4e]/30">
+                    {currency}
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-400">
+                  {currency === 'USD' ? 'US Dollar ($)' : currency === 'TZS' ? 'Tanzanian Shilling' : currency === 'EUR' ? 'Euro (€)' : 'British Pound (£)'}
+                </p>
+              </div>
+            </div>
+            <ChevronRight className="w-3.5 h-3.5 text-slate-400 group-hover:text-white group-hover:translate-x-0.5 transition" />
+          </button>
+        </div>
 
         {/* User Account / Google Connection Footer */}
         <div className={`${sidebarCollapsed ? 'md:p-2 md:py-3' : 'p-3'} border-t border-[#1b2a41] bg-[#09111d]`}>
@@ -2422,36 +2816,44 @@ export default function App() {
                     {user.email?.charAt(0).toUpperCase() || 'K'}
                   </div>
                 )}
-                {(!sidebarCollapsed || mobileSidebarOpen) && (
-                  <div className="truncate">
+                <div className={`truncate ${sidebarCollapsed ? 'md:hidden' : ''}`}>
+                  <div className="flex items-center space-x-1.5">
                     <p className="text-xs font-bold text-white tracking-tight truncate">
-                      {user.displayName || 'Google Account'}
+                      {user.displayName || user.email?.split('@')[0] || 'User'}
                     </p>
-                    <p className="text-[10px] text-emerald-400 flex items-center space-x-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
-                      <span>Sheets Connected</span>
-                    </p>
+                    <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase tracking-wider ${
+                      isAdmin
+                        ? 'bg-amber-400/20 text-[#fdbe4e]'
+                        : isPropertyManager
+                        ? 'bg-sky-400/20 text-sky-400'
+                        : 'bg-emerald-400/20 text-emerald-400'
+                    }`}>
+                      {isAdmin ? 'Admin' : isPropertyManager ? 'Manager' : 'Staff'}
+                    </span>
                   </div>
-                )}
+                  <p className="text-[10px] text-slate-400 font-mono truncate">
+                    {user.email}
+                  </p>
+                </div>
               </div>
-              {(!sidebarCollapsed || mobileSidebarOpen) && (
-                <button
-                  onClick={handleSignOut}
-                  title="Disconnect Google Account"
-                  className="p-1 text-slate-500 hover:text-rose-400 transition cursor-pointer"
-                >
-                  <LogOut className="w-4 h-4" />
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={handleSignOut}
+                title="Disconnect Google Account"
+                className={`p-1 text-slate-500 hover:text-rose-400 transition cursor-pointer ${sidebarCollapsed ? 'md:hidden' : ''}`}
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
             </div>
           ) : (
             <div className="p-1">
               <button
+                type="button"
                 onClick={handleSignIn}
                 disabled={isSigningIn}
-                title="Connect Sheets (Sign in with Google)"
+                title="Login (Sign in with Google)"
                 className={`w-full flex items-center justify-center ${
-                  sidebarCollapsed ? 'md:h-9 md:w-9 md:mx-auto md:p-0' : 'space-x-2 py-2 px-3'
+                  sidebarCollapsed ? 'md:h-10 md:w-10 md:mx-auto md:p-0' : 'space-x-2 py-2 px-3'
                 } rounded-xl bg-white text-slate-800 hover:bg-slate-100 text-xs font-semibold shadow-xs transition cursor-pointer`}
               >
                 <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24">
@@ -2472,7 +2874,7 @@ export default function App() {
                     d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.25 2.64 1.25 6.61l4.02 3.15c.95-2.85 3.6-4.96 6.73-4.96z"
                   />
                 </svg>
-                {(!sidebarCollapsed || mobileSidebarOpen) && <span>{isSigningIn ? 'Connecting...' : 'Connect Sheets'}</span>}
+                <span className={sidebarCollapsed ? 'md:hidden ml-2' : 'ml-2'}>{isSigningIn ? 'Logging in...' : 'Login'}</span>
               </button>
             </div>
           )}
@@ -2481,175 +2883,367 @@ export default function App() {
       </aside>
 
       {/* MAIN VIEWPORT */}
-      <div className="flex-1 flex flex-col overflow-y-auto">
+      <div className="flex-1 flex flex-col min-w-0 overflow-y-auto pb-20 md:pb-0">
         
         {/* Top Header Controls */}
-        <header className="bg-white/95 backdrop-blur-xs border-b border-[#e8e4dc] sticky top-0 z-30 px-3 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between gap-2 sm:gap-4">
+        <header className="bg-white/95 backdrop-blur-xs border-b border-[#e8e4dc] sticky top-0 z-30 px-3 sm:px-6 py-2.5 sm:py-3">
           
-          {/* Left: Mobile Menu Toggle & Search Bar */}
-          <div className="flex items-center gap-2 flex-1 max-w-md">
+          {/* MOBILE TOP HEADER: Search Icon (far-left), New Booking Button (center), and Notifications Icon (far-right) */}
+          <div className="md:hidden flex items-center justify-between w-full">
+            {/* 1. Search Icon on the far left */}
             <button
-              onClick={() => setMobileSidebarOpen(true)}
-              className="md:hidden p-2 rounded-xl border border-[#e8e4dc] text-slate-700 hover:bg-slate-50 transition cursor-pointer"
-              title="Open Navigation Menu"
+              type="button"
+              onClick={() => setIsMobileSearchOpen(true)}
+              className="p-2.5 rounded-xl border border-[#e8e4dc] bg-white text-slate-700 hover:bg-slate-50 transition cursor-pointer shadow-2xs active:scale-95 shrink-0"
+              title="Search guest records, room, phone, or bookings"
+              aria-label="Open search popup"
             >
-              <Menu className="w-4 h-4" />
+              <Search className="w-5 h-5 text-slate-700" />
             </button>
 
-            {/* Search bar */}
-            <div className="flex-1 relative">
+            {/* 2. New Booking Button at the center */}
+            <button
+              type="button"
+              onClick={() => handleOpenNewModal()}
+              className="flex items-center space-x-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs px-4 py-2 rounded-xl shadow-xs transition active:scale-95 cursor-pointer"
+              title="Create new booking"
+            >
+              <Plus className="w-4 h-4 stroke-[2.5]" />
+              <span>New Booking</span>
+            </button>
+
+            {/* 3. Notifications icon on the far right */}
+            <button
+              type="button"
+              onClick={() => setIsNotificationsOpen(true)}
+              className={`relative p-2.5 rounded-xl border transition cursor-pointer shadow-2xs active:scale-95 flex items-center justify-center shrink-0 ${
+                actionItems.length > 0 || conflicts.length > 0
+                  ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300'
+                  : 'bg-white hover:bg-slate-50 text-slate-600 border-[#e8e4dc]'
+              }`}
+              title="Action Center & Notifications"
+              aria-label="Open notifications"
+            >
+              {actionItems.some(a => a.severity === 'high') || conflicts.length > 0 ? (
+                <BellRing className="w-5 h-5 text-amber-600 animate-wiggle" />
+              ) : (
+                <Bell className="w-5 h-5 text-slate-700" />
+              )}
+              {(actionItems.length > 0 || conflicts.length > 0) && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-600 text-white rounded-full font-bold text-[9px] flex items-center justify-center shadow-xs">
+                  {actionItems.length + conflicts.length}
+                </span>
+              )}
+            </button>
+          </div>
+
+          {/* DESKTOP TOP HEADER (>= md viewport) */}
+          <div className="hidden md:flex items-center justify-between w-full gap-4">
+            
+            {/* Desktop Left: Global Search Bar */}
+            <div className="flex items-center gap-2 flex-1 max-w-md">
+
+            {/* Global Search Bar with Recent Searches Dropdown */}
+            <div ref={searchContainerRef} className="flex-1 relative">
               <input
                 type="text"
                 value={globalSearch}
-                onChange={e => setGlobalSearch(e.target.value)}
-                placeholder="Search guest, ID, phone..."
-                className="w-full bg-[#f6f3ed] border border-[#e5dfd3] rounded-xl pl-8 sm:pl-9 pr-3 py-1.5 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] focus:bg-white transition"
+                onFocus={() => setIsSearchFocused(true)}
+                onChange={e => {
+                  setGlobalSearch(e.target.value);
+                  setIsSearchFocused(true);
+                }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && globalSearch.trim()) {
+                    addRecentSearch({ query: globalSearch.trim(), type: 'search' });
+                    setIsSearchFocused(false);
+                    setActiveTab('bookings');
+                  } else if (e.key === 'Escape') {
+                    setIsSearchFocused(false);
+                  }
+                }}
+                placeholder="Search guest, ID, phone, room..."
+                className="w-full bg-[#f6f3ed] border border-[#e5dfd3] rounded-xl pl-8 sm:pl-9 pr-7 sm:pr-8 py-1.5 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] focus:bg-white transition"
               />
-              <Search className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-400 absolute left-2.5 sm:left-3 top-2.5" />
-            </div>
-          </div>
+              <Search className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-400 absolute left-2.5 sm:left-3 top-2.5 pointer-events-none" />
 
-          {/* Right Header Buttons */}
-          <div className="flex items-center space-x-1.5 sm:space-x-3">
+              {/* Clear Search Input Button */}
+              {globalSearch && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGlobalSearch('');
+                    setIsSearchFocused(true);
+                  }}
+                  className="absolute right-2 top-2 p-0.5 text-slate-400 hover:text-slate-600 rounded-md hover:bg-slate-200/50 transition cursor-pointer"
+                  title="Clear search"
+                  aria-label="Clear search input"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
 
-            {/* Action Items Notification Bell */}
-            <div className="relative">
-              <button
-                onClick={() => setIsNotificationsOpen(prev => !prev)}
-                className={`relative p-2 rounded-xl border transition cursor-pointer flex items-center justify-center ${
-                  actionItems.length > 0
-                    ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-200'
-                    : 'bg-white hover:bg-slate-50 text-slate-500 border-[#e8e4dc]'
-                }`}
-                title="Operational action items"
-              >
-                {actionItems.some(a => a.severity === 'high') ? (
-                  <BellRing className="w-4 h-4 text-amber-600 animate-wiggle" />
-                ) : (
-                  <Bell className="w-4 h-4" />
-                )}
-                {actionItems.length > 0 && (
-                  <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-600 text-white rounded-full font-bold text-[9px] flex items-center justify-center shadow-xs">
-                    {actionItems.length}
-                  </span>
-                )}
-              </button>
-
-              {/* Notification Popover Dropdown */}
-              {isNotificationsOpen && (
-                <div className="absolute right-0 mt-2 w-72 sm:w-96 bg-white rounded-2xl shadow-2xl border border-[#e8e4dc] z-50 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-                  <div className="p-3.5 bg-[#0d1726] text-white flex items-center justify-between">
-                    <div className="flex items-center space-x-2">
-                      <Bell className="w-4 h-4 text-[#fdbe4e]" />
-                      <span className="font-bold text-xs">Action Center</span>
-                      <span className="bg-[#fdbe4e]/20 text-[#fdbe4e] text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold">
-                        {actionItems.length} tasks
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => setIsNotificationsOpen(false)}
-                      className="text-slate-400 hover:text-white p-1 rounded-md"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-
-                  <div className="max-h-80 overflow-y-auto divide-y divide-[#f2ede4]">
-                    {actionItems.length === 0 ? (
-                      <div className="p-6 text-center">
-                        <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-2" />
-                        <p className="text-xs font-bold text-slate-800">All caught up!</p>
-                        <p className="text-[11px] text-slate-400 mt-0.5">No critical warnings or pending room actions.</p>
+              {/* RECENT SEARCHES & QUICK GUEST RECORDS DROPDOWN */}
+              {isSearchFocused && (
+                <div className="absolute left-0 right-0 top-full mt-1.5 bg-white rounded-2xl shadow-xl border border-[#e8e4dc] z-50 overflow-hidden animate-in fade-in zoom-in-95 duration-150 min-w-[300px] sm:min-w-[380px]">
+                  
+                  {/* Case A: Query is Empty - Show Recent Searches History */}
+                  {!globalSearch.trim() ? (
+                    <div>
+                      {/* Header */}
+                      <div className="px-3.5 py-2.5 bg-[#faf8f5] border-b border-[#f1ede4] flex items-center justify-between">
+                        <div className="flex items-center space-x-1.5 text-xs font-semibold text-slate-700">
+                          <History className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Recent Searches & Frequently Viewed</span>
+                        </div>
+                        {recentSearches.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={clearAllRecentSearches}
+                            className="text-[10px] text-slate-400 hover:text-rose-600 font-medium transition cursor-pointer"
+                          >
+                            Clear All
+                          </button>
+                        )}
                       </div>
-                    ) : (
-                      actionItems.map(item => (
-                        <div
-                          key={item.id}
-                          onClick={() => {
-                            if (item.booking) {
-                              handleOpenEditModal(item.booking);
-                            }
-                            setIsNotificationsOpen(false);
-                          }}
-                          className="p-3 hover:bg-[#faf8f5] transition cursor-pointer flex items-start space-x-2.5 text-left"
-                        >
-                          <div className="mt-0.5 shrink-0">
-                            {item.severity === 'high' ? (
-                              <div className="w-6 h-6 rounded-lg bg-rose-100 text-rose-600 flex items-center justify-center">
-                                <AlertTriangle className="w-3.5 h-3.5" />
+
+                      {/* Items List */}
+                      {recentSearches.length === 0 ? (
+                        <div className="p-5 text-center">
+                          <Clock className="w-6 h-6 text-slate-300 mx-auto mb-1.5" />
+                          <p className="text-xs font-bold text-slate-700">No recent searches yet</p>
+                          <p className="text-[11px] text-slate-400 mt-0.5 max-w-xs mx-auto">
+                            Search by guest name, booking ID, room, or phone number to see your search history and frequently accessed records here.
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="max-h-72 overflow-y-auto divide-y divide-[#f7f5f0]">
+                          {recentSearches.map(item => (
+                            <div
+                              key={item.id}
+                              onClick={() => {
+                                setGlobalSearch(item.query);
+                                setIsSearchFocused(false);
+                                setActiveTab('bookings');
+                                if (item.bookingId) {
+                                  const found = reservations.find(r => r.id === item.bookingId);
+                                  if (found && (isAdmin || isPropertyManager)) {
+                                    handleOpenEditModal(found);
+                                  }
+                                }
+                              }}
+                              className="px-3.5 py-2.5 hover:bg-[#fbf9f5] flex items-center justify-between gap-2 group transition cursor-pointer text-left"
+                            >
+                              <div className="flex items-center space-x-2.5 min-w-0 flex-1">
+                                <div className="w-7 h-7 rounded-lg bg-slate-100 group-hover:bg-[#fdbe4e]/20 text-slate-500 group-hover:text-amber-800 flex items-center justify-center shrink-0 transition">
+                                  {item.type === 'guest_record' ? (
+                                    <Users className="w-3.5 h-3.5 text-amber-700" />
+                                  ) : (
+                                    <Clock className="w-3.5 h-3.5 text-slate-500" />
+                                  )}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center space-x-1.5">
+                                    <span className="text-xs font-bold text-slate-800 group-hover:text-amber-950 truncate">
+                                      {item.guestName || item.query}
+                                    </span>
+                                    {item.bookingId && (
+                                      <span className="text-[10px] font-mono text-amber-900 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 shrink-0 font-medium">
+                                        {item.bookingId}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {(item.room || item.dates) && (
+                                    <div className="text-[10px] text-slate-400 truncate mt-0.5">
+                                      {item.room && <span>{item.room}</span>}
+                                      {item.bedCode && <span> · Bed {item.bedCode}</span>}
+                                      {item.dates && <span> · {item.dates}</span>}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            ) : item.type === 'checkin' ? (
-                              <div className="w-6 h-6 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center">
-                                <Users className="w-3.5 h-3.5" />
-                              </div>
-                            ) : item.type === 'payment' ? (
-                              <div className="w-6 h-6 rounded-lg bg-amber-100 text-amber-700 flex items-center justify-center">
-                                <CreditCard className="w-3.5 h-3.5" />
-                              </div>
-                            ) : (
-                              <div className="w-6 h-6 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center">
-                                <Sparkles className="w-3.5 h-3.5" />
-                              </div>
-                            )}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-xs font-bold text-slate-900 leading-tight">{item.title}</p>
-                            <p className="text-[11px] text-slate-500 mt-0.5 line-clamp-2">{item.description}</p>
-                            <div className="mt-1 flex items-center space-x-2 text-[10px] text-amber-700 font-semibold">
-                              <span>Take action &rarr;</span>
+                              <button
+                                type="button"
+                                onClick={e => removeRecentSearch(item.id, e)}
+                                title="Remove from recent searches"
+                                aria-label="Remove search item"
+                                className="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-rose-600 rounded-md hover:bg-slate-200/50 transition cursor-pointer shrink-0"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
                             </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Footer Tip */}
+                      <div className="p-2 bg-[#faf8f5] border-t border-[#f1ede4] text-center">
+                        <p className="text-[10px] text-slate-400">
+                          Click any record to jump straight to folio or filter bookings
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Case B: Query is Active - Show Matching Live Guest Records & Search Action */
+                    <div>
+                      {/* Live matching records from database */}
+                      {matchingReservations.length > 0 && (
+                        <div>
+                          <div className="px-3.5 py-2 bg-[#faf8f5] border-b border-[#f1ede4] text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center justify-between">
+                            <span>Matching Guest Records ({matchingReservations.length})</span>
+                            <span className="text-amber-700 font-semibold">1-Click Folio</span>
+                          </div>
+                          <div className="divide-y divide-[#f7f5f0]">
+                            {matchingReservations.map(res => (
+                              <div
+                                key={res.id}
+                                onClick={() => {
+                                  addRecentSearch({
+                                    query: res.guestName,
+                                    type: 'guest_record',
+                                    bookingId: res.id,
+                                    guestName: res.guestName,
+                                    room: res.room,
+                                    bedCode: res.unitId || res.bedCode,
+                                    dates: `${res.checkIn} to ${res.checkOut}`,
+                                    status: res.status
+                                  });
+                                  setGlobalSearch(res.guestName);
+                                  setIsSearchFocused(false);
+                                  setActiveTab('bookings');
+                                  if (isAdmin || isPropertyManager) {
+                                    handleOpenEditModal(res);
+                                  }
+                                }}
+                                className="px-3.5 py-2 hover:bg-[#fbf9f5] flex items-center justify-between gap-2 group transition cursor-pointer text-left"
+                              >
+                                <div className="flex items-center space-x-2.5 min-w-0 flex-1">
+                                  <div className="w-7 h-7 rounded-lg bg-amber-50 group-hover:bg-[#fdbe4e]/20 text-amber-700 flex items-center justify-center shrink-0">
+                                    <Users className="w-3.5 h-3.5" />
+                                  </div>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center space-x-1.5">
+                                      <span className="text-xs font-bold text-slate-800 group-hover:text-amber-950 truncate">
+                                        {res.guestName}
+                                      </span>
+                                      <span className="text-[10px] font-mono text-slate-500">
+                                        ({res.id})
+                                      </span>
+                                    </div>
+                                    <div className="text-[10px] text-slate-400 truncate">
+                                      {res.room} · Bed {res.bedCode || res.unitId} · {res.checkIn} to {res.checkOut}
+                                    </div>
+                                  </div>
+                                </div>
+                                <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded shrink-0 border border-emerald-200">
+                                  {res.status}
+                                </span>
+                              </div>
+                            ))}
                           </div>
                         </div>
-                      ))
-                    )}
-                  </div>
+                      )}
 
-                  {actionItems.length > 0 && (
-                    <div className="p-2.5 bg-[#fbf9f5] border-t border-[#f1ede4] text-center">
-                      <p className="text-[10px] text-slate-400">Click any notification to resolve or view the booking</p>
+                      {/* Matching Recent Searches (if user's past queries match) */}
+                      {(() => {
+                        const q = globalSearch.toLowerCase().trim();
+                        const matchingHistory = recentSearches.filter(
+                          item => (item.guestName || item.query).toLowerCase().includes(q)
+                        );
+                        if (matchingHistory.length > 0) {
+                          return (
+                            <div>
+                              <div className="px-3.5 py-1.5 bg-[#faf8f5] border-y border-[#f1ede4] text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                Recent Searches
+                              </div>
+                              <div className="divide-y divide-[#f7f5f0]">
+                                {matchingHistory.map(item => (
+                                  <div
+                                    key={item.id}
+                                    onClick={() => {
+                                      setGlobalSearch(item.query);
+                                      setIsSearchFocused(false);
+                                      setActiveTab('bookings');
+                                    }}
+                                    className="px-3.5 py-2 hover:bg-[#fbf9f5] flex items-center justify-between gap-2 group transition cursor-pointer text-left"
+                                  >
+                                    <div className="flex items-center space-x-2 text-xs text-slate-700">
+                                      <History className="w-3.5 h-3.5 text-slate-400" />
+                                      <span className="font-medium group-hover:text-slate-900">{item.query}</span>
+                                    </div>
+                                    <ArrowRight className="w-3 h-3 text-slate-400 group-hover:text-slate-600" />
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
+
+                      {/* Bottom Action: Filter Bookings */}
+                      <div
+                        onClick={() => {
+                          addRecentSearch({ query: globalSearch.trim(), type: 'search' });
+                          setIsSearchFocused(false);
+                          setActiveTab('bookings');
+                        }}
+                        className="p-2.5 bg-[#fbf9f5] hover:bg-[#f6f2e9] border-t border-[#f1ede4] flex items-center justify-between transition cursor-pointer text-xs font-semibold text-slate-700"
+                      >
+                        <div className="flex items-center space-x-2">
+                          <Search className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Filter all bookings for &ldquo;<span className="text-slate-950 font-bold">{globalSearch}</span>&rdquo;</span>
+                        </div>
+                        <span className="text-[10px] font-mono text-slate-400 bg-white border border-[#e8e4dc] px-1.5 py-0.5 rounded shadow-2xs">
+                          Enter ↵
+                        </span>
+                      </div>
                     </div>
                   )}
                 </div>
               )}
             </div>
+          </div>
 
-            {/* Admin Authorization Status Pill */}
-            {isAdmin ? (
-              <button
-                onClick={() => setIsAdminAuthModalOpen(true)}
-                className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
-                title={`Hostel Administrator Authorized: ${user?.email}. Full booking editing unlocked.`}
-              >
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
-                <span className="font-bold">Admin:</span>
-                <span className="font-mono text-[11px] text-emerald-800 truncate max-w-[120px]">{user?.email?.split('@')[0]}</span>
-              </button>
-            ) : user ? (
-              <button
-                onClick={() => setIsAdminAuthModalOpen(true)}
-                className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
-                title={`Staff Account: ${user.email}. Admin authorization required to edit bookings.`}
-              >
-                <ShieldAlert className="w-3.5 h-3.5 text-amber-600" />
-                <span>Staff (View-Only)</span>
-              </button>
-            ) : (
-              <button
-                onClick={() => setIsAdminAuthModalOpen(true)}
-                className="hidden sm:flex items-center space-x-1.5 px-3 py-1.5 bg-[#f6f3ed] hover:bg-amber-50 text-slate-700 hover:text-amber-950 border border-[#e5dfd3] hover:border-amber-300 rounded-xl text-xs font-semibold transition cursor-pointer shadow-2xs"
-                title="Admin Access Authorization. Click to log in as authorized admin."
-              >
-                <Lock className="w-3.5 h-3.5 text-amber-600" />
-                <span>Admin Login</span>
-              </button>
-            )}
+          {/* Right Header Buttons */}
+          <div className="flex items-center space-x-1.5 sm:space-x-2.5">
+
+
+            {/* Action Items Notification Bell */}
+            <button
+              type="button"
+              onClick={() => setIsNotificationsOpen(true)}
+              className={`relative p-2 rounded-xl border transition cursor-pointer flex items-center justify-center ${
+                actionItems.length > 0 || conflicts.length > 0
+                  ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-200'
+                  : 'bg-white hover:bg-slate-50 text-slate-500 border-[#e8e4dc]'
+              }`}
+              title="Operational action items"
+            >
+              {actionItems.some(a => a.severity === 'high') || conflicts.length > 0 ? (
+                <BellRing className="w-4 h-4 text-amber-600 animate-wiggle" />
+              ) : (
+                <Bell className="w-4 h-4" />
+              )}
+              {(actionItems.length > 0 || conflicts.length > 0) && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-600 text-white rounded-full font-bold text-[9px] flex items-center justify-center shadow-xs">
+                  {actionItems.length + conflicts.length}
+                </span>
+              )}
+            </button>
+
 
             {/* Currency Selector */}
             <div className="flex bg-[#f6f3ed] p-0.5 rounded-lg border border-[#e5dfd3] text-[11px] font-semibold">
               {(['USD', 'TZS', 'EUR'] as const).map(curr => (
                 <button
                   key={curr}
-                  onClick={() => setCurrency(curr)}
+                  onClick={() => {
+                    setCurrency(curr);
+                    try {
+                      localStorage.setItem('muh_currency_preference', curr);
+                    } catch {}
+                  }}
                   className={`px-1.5 sm:px-2 py-0.5 rounded transition ${
                     currency === curr ? 'bg-[#fdbe4e] text-[#0d1726] font-bold shadow-2xs' : 'text-slate-600 hover:text-slate-900'
                   }`}
@@ -2669,11 +3263,58 @@ export default function App() {
               <span className="sm:hidden">New</span>
             </button>
           </div>
+        </div>
 
         </header>
 
         {/* Content Panes */}
         <main className="flex-1 p-3 sm:p-4 md:p-6 max-w-7xl w-full mx-auto space-y-4 sm:space-y-6 min-w-0">
+
+          {/* ======================================================== */}
+          {/* GLOBAL BOOKING CONFLICT ALERT BANNER                     */}
+          {/* ======================================================== */}
+          {conflicts.length > 0 && !isConflictBannerDismissed && (
+            <div className="bg-rose-50 border border-rose-200/90 rounded-2xl p-4 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-in fade-in slide-in-from-top-2 duration-200">
+              <div className="flex items-start sm:items-center space-x-3">
+                <div className="w-8 h-8 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0 mt-0.5 sm:mt-0">
+                  <AlertTriangle className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <h3 className="font-bold text-rose-950 text-xs sm:text-sm tracking-tight">
+                      Booking Conflict Alert: {conflicts.length} conflict{conflicts.length > 1 ? 's' : ''} detected
+                    </h3>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-rose-800 bg-rose-200/80 px-2 py-0.5 rounded-full">
+                      Double-Booking Warning
+                    </span>
+                  </div>
+                  <p className="text-xs text-rose-800 mt-1">
+                    {conflicts[0].description}
+                    {conflicts.length > 1 && ` (+${conflicts.length - 1} more conflict${conflicts.length > 2 ? 's' : ''})`}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center space-x-2 self-end sm:self-center shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsConflictModalOpen(true)}
+                  className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl shadow-xs transition cursor-pointer flex items-center space-x-1.5"
+                >
+                  <span>Review & Resolve</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsConflictBannerDismissed(true)}
+                  className="p-1.5 text-rose-400 hover:text-rose-700 rounded-lg hover:bg-rose-100 transition cursor-pointer"
+                  title="Dismiss banner for now"
+                  aria-label="Dismiss banner"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* ======================================================== */}
           {/* TAB 1: OVERVIEW                                          */}
@@ -5692,6 +6333,37 @@ export default function App() {
             </div>
           )}
 
+          {/* ======================================================== */}
+          {/* TAB 7: ADMIN PANEL (ROLE & USER MANAGEMENT)              */}
+          {/* ======================================================== */}
+          {activeTab === 'admin' && (
+            isAdmin ? (
+              <AdminPanel
+                currentUserEmail={user?.email || null}
+                onToast={triggerToast}
+              />
+            ) : (
+              <div className="bg-white rounded-2xl border border-rose-200 p-8 text-center space-y-4 max-w-lg mx-auto my-12 shadow-sm">
+                <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center mx-auto">
+                  <Lock className="w-6 h-6" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold text-slate-900">Admin Panel Access Restricted</h2>
+                  <p className="text-xs text-slate-500 mt-1">
+                    This management section is exclusively available to authorized administrators (wolfgodie@gmail.com, designkilifair@gmail.com, gdnjau@gmail.com).
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('overview')}
+                  className="px-4 py-2 bg-slate-900 text-white rounded-xl text-xs font-semibold hover:bg-slate-800 transition cursor-pointer"
+                >
+                  Return to Overview
+                </button>
+              </div>
+            )
+          )}
+
         </main>
 
         {/* Global Hostel Footer */}
@@ -5791,9 +6463,10 @@ export default function App() {
                     </span>
                     <div className="space-y-1.5 font-mono text-[11px]">
                       {[
-                        { email: 'wolfgodie@gmail.com', role: 'Hostel Administrator' },
-                        { email: 'gdnjau@gmail.com', role: 'Hostel Administrator' },
-                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Administrator' }
+                        { email: 'wolfgodie@gmail.com', role: 'Admin (Full Control)' },
+                        { email: 'designkilifair@gmail.com', role: 'Admin (Full Control)' },
+                        { email: 'gdnjau@gmail.com', role: 'Admin (Full Control)' },
+                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Manager (Bookings)' }
                       ].map(acc => (
                         <div key={acc.email} className={`flex items-center justify-between p-2 rounded-xl border ${
                           user?.email?.toLowerCase().trim() === acc.email
@@ -5819,10 +6492,10 @@ export default function App() {
                     <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
                     <div>
                       <strong className="block font-bold text-xs text-amber-950">
-                        Admin Authorization Required
+                        Higher Authorization Required
                       </strong>
                       <p className="text-[11px] text-amber-800 mt-0.5 leading-relaxed">
-                        Signed in as <span className="font-bold underline">{user.email}</span> (Staff / View-only). To {adminAuthReason}, you must switch to an authorized Google Administrator account.
+                        Signed in as <span className="font-bold underline">{user.email}</span> ({currentUserRole === 'manager' ? 'Property Manager' : 'Staff / View-only'}). To {adminAuthReason}, you must switch to an authorized Google Administrator account.
                       </p>
                     </div>
                   </div>
@@ -5833,9 +6506,10 @@ export default function App() {
                     </span>
                     <div className="space-y-1.5 font-mono text-[11px]">
                       {[
-                        { email: 'wolfgodie@gmail.com', role: 'Hostel Administrator' },
-                        { email: 'gdnjau@gmail.com', role: 'Hostel Administrator' },
-                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Administrator' }
+                        { email: 'wolfgodie@gmail.com', role: 'Admin (Full Control)' },
+                        { email: 'designkilifair@gmail.com', role: 'Admin (Full Control)' },
+                        { email: 'gdnjau@gmail.com', role: 'Admin (Full Control)' },
+                        { email: 'moshiurbanproperty@gmail.com', role: 'Property Manager' }
                       ].map(acc => (
                         <div key={acc.email} className="flex items-center justify-between p-2 rounded-xl bg-white border border-[#f1ede4] text-slate-700">
                           <div className="flex items-center space-x-2 truncate">
@@ -5921,300 +6595,335 @@ export default function App() {
 
       {/* CREATE / EDIT RESERVATION MODAL */}
       {isBookingModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-[#e8e4dc] my-6 animate-in fade-in zoom-in-95 duration-200">
-            <div className="flex items-center justify-between pb-3 border-b border-[#f1ede4]">
-              <div>
-                <h3 className="text-base sm:text-lg font-semibold text-slate-900">
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs overflow-y-auto p-2 sm:p-4 flex justify-center items-start sm:items-center">
+          <div className="relative bg-white rounded-2xl max-w-lg w-full shadow-2xl border border-[#e8e4dc] my-2 sm:my-8 flex flex-col max-h-[calc(100dvh-1rem)] sm:max-h-[92vh] overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            {/* Pinned Responsive Header with Close Button */}
+            <div className="flex items-center justify-between px-5 sm:px-6 py-3.5 sm:py-4 border-b border-[#f1ede4] bg-white shrink-0 z-10">
+              <div className="pr-3">
+                <h3 className="text-base sm:text-lg font-semibold text-slate-900 leading-tight">
                   {editingBooking ? `Edit Reservation (${formData.id})` : 'New Reservation'}
                 </h3>
-                <p className="text-xs text-slate-400">Writes directly to your Google Spreadsheet database</p>
+                <p className="text-xs text-slate-400 mt-0.5">Writes directly to Google Spreadsheet & Firestore</p>
               </div>
               <button
                 type="button"
                 onClick={() => setIsBookingModalOpen(false)}
-                className="text-slate-400 hover:text-slate-600 p-1.5 rounded-lg hover:bg-slate-100"
+                aria-label="Close booking form"
+                title="Close booking form"
+                className="w-10 h-10 sm:w-9 sm:h-9 flex items-center justify-center text-slate-500 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition cursor-pointer shrink-0 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <form onSubmit={handleFormSubmit} className="mt-4 space-y-4 text-xs">
-              {/* Guest Name & Guest ID */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="sm:col-span-2">
-                  <label className="block font-semibold text-slate-700 mb-1">Guest Name *</label>
-                  <input
-                    type="text"
-                    required
-                    value={formData.guestName}
-                    onChange={e => handleGuestNameChange(e.target.value)}
-                    placeholder="e.g. Godwin Njau"
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
-                  <span className="text-[10px] text-slate-400 mt-0.5 block">
-                    Auto-creates ID: 1st letters of first & last name + unique random number
-                  </span>
-                </div>
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block font-semibold text-slate-700">Guest ID</label>
-                    <button
-                      type="button"
-                      onClick={handleRollGuestId}
-                      title="Roll fresh unique random ID"
-                      className="text-[10px] font-semibold text-amber-800 hover:text-amber-950 flex items-center space-x-1 cursor-pointer bg-amber-50 hover:bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200 transition"
-                    >
-                      <Dices className="w-3 h-3 text-[#fdbe4e]" />
-                      <span>Roll</span>
-                    </button>
-                  </div>
-                  <input
-                    type="text"
-                    value={formData.guestId}
-                    onChange={e => setFormData(prev => ({ ...prev, guestId: e.target.value }))}
-                    placeholder="e.g. GN-4921"
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 font-mono font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
-                </div>
-              </div>
-
-              {/* Email & Phone */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Email Address</label>
-                  <input
-                    type="email"
-                    value={formData.email}
-                    onChange={e => setFormData(prev => ({ ...prev, email: e.target.value }))}
-                    placeholder="e.g. guest@example.com"
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Phone Number</label>
-                  <input
-                    type="tel"
-                    value={formData.phone}
-                    onChange={e => setFormData(prev => ({ ...prev, phone: e.target.value }))}
-                    placeholder="e.g. 255756200540"
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
-                </div>
-              </div>
-
-              {/* Dates */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Check-in *</label>
-                  <input
-                    type="date"
-                    required
-                    value={formData.checkIn}
-                    onChange={e => handleDateChange(e.target.value, formData.checkOut)}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Check-out *</label>
-                  <input
-                    type="date"
-                    required
-                    value={formData.checkOut}
-                    onChange={e => handleDateChange(formData.checkIn, e.target.value)}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
-                </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Nights</label>
-                  <input
-                    type="number"
-                    readOnly
-                    value={formData.nights}
-                    className="w-full bg-slate-100 border border-[#e8e4dc] rounded-xl px-3 py-2 font-bold text-slate-700"
-                  />
-                </div>
-              </div>
-
-              {/* Dynamic Room & Bed Code with Live Availability Filtering */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block font-semibold text-slate-700">Room Category *</label>
-                    <span className="text-[10px] text-emerald-700 font-medium">Availability for dates</span>
-                  </div>
-                  <select
-                    value={formData.room}
-                    onChange={e => {
-                      const roomName = e.target.value;
-                      const avail = modalAvailability[roomName];
-                      const firstAvailableBed = avail?.availableBeds[0]?.id;
-                      const roomObj = HOSTEL_ROOMS.find(r => roomName.includes(r.name));
-                      const defaultBed = firstAvailableBed || roomObj?.units[0]?.id || 'M-S1';
-                      setFormData(prev => ({
-                        ...prev,
-                        room: roomName,
-                        bedCode: defaultBed
-                      }));
-                    }}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  >
-                    {HOSTEL_ROOMS.map(room => {
-                      const fullName = `${room.name} (${room.roomCode})`;
-                      const avail = modalAvailability[fullName] || modalAvailability[room.name];
-                      const freeCount = avail?.availableBedsCount ?? room.capacity;
-                      const isFull = freeCount <= 0;
-                      return (
-                        <option key={room.id} value={fullName} disabled={isFull}>
-                          {fullName} {isFull ? '• [FULL - 0 beds free]' : `• (${freeCount} of ${room.capacity} beds free)`}
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block font-semibold text-slate-700">Available Bed Code *</label>
-                    <span className="text-[10px] text-slate-500 font-medium">Unoccupied only</span>
-                  </div>
-                  <select
-                    value={formData.bedCode}
-                    onChange={e => setFormData(prev => ({ ...prev, bedCode: e.target.value }))}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  >
-                    {(() => {
-                      const avail = modalAvailability[formData.room];
-                      const availableBeds = avail?.availableBeds || [];
-                      if (availableBeds.length === 0) {
-                        return <option value="" disabled>No beds available in this room for these dates</option>;
-                      }
-                      return availableBeds.map(u => (
-                        <option key={u.id} value={u.id}>
-                          {u.id} — {u.place} (Available)
-                        </option>
-                      ));
-                    })()}
-                  </select>
-                </div>
-              </div>
-
-              {/* Bed Occupancy Alert / Note if any beds are occupied for these dates */}
-              {(() => {
-                const avail = modalAvailability[formData.room];
-                if (avail && avail.occupiedBeds.length > 0) {
-                  return (
-                    <div className="p-2.5 bg-amber-50/80 border border-amber-200 rounded-xl text-[11px] text-amber-900 flex items-start space-x-2">
-                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600 mt-0.5 shrink-0" />
-                      <div>
-                        <span className="font-semibold">Occupied in {formData.room} for selected dates:</span>{' '}
-                        {avail.occupiedBeds.map(b => `${b.id} (${b.guestName} until ${b.checkOut})`).join(', ')}
-                      </div>
+            <form onSubmit={handleFormSubmit} className="flex flex-col flex-1 overflow-hidden min-h-0">
+              {/* Scrollable Form Body */}
+              <div className="overflow-y-auto p-4 sm:p-6 space-y-4 text-xs overscroll-contain flex-1">
+                {/* Live In-Form Booking Conflict Alert Banner */}
+                {formConflict && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-950 flex items-start space-x-2.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="font-bold text-rose-900">⚠️ Booking Conflict Detected</div>
+                      <p className="mt-0.5 text-[11px] text-rose-800">{formConflict.description}</p>
                     </div>
-                  );
-                }
-                return null;
-              })()}
+                  </div>
+                )}
 
-              {/* Total & Paid */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Total (USD $)</label>
-                  <input
-                    type="number"
-                    value={formData.totalAmount}
-                    onChange={e => {
-                      const total = Number(e.target.value) || 0;
-                      setFormData(prev => ({
-                        ...prev,
-                        totalAmount: total,
-                        balanceDue: Math.max(0, total - prev.paidAmount)
-                      }));
-                    }}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
+                {/* All Rooms Full Alert Banner */}
+                {availableRooms.length === 0 && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-950 flex items-start space-x-2.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="font-bold text-rose-900">⚠️ All Rooms Fully Booked</div>
+                      <p className="mt-0.5 text-[11px] text-rose-800">
+                        There are no available beds for these dates ({formData.checkIn} to {formData.checkOut}). Please select different dates to prevent booking conflicts.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Guest Name & Guest ID */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-2">
+                    <label className="block font-semibold text-slate-700 mb-1">Guest Name *</label>
+                    <input
+                      type="text"
+                      required
+                      value={formData.guestName}
+                      onChange={e => handleGuestNameChange(e.target.value)}
+                      placeholder="e.g. Godwin Njau"
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                    <span className="text-[10px] text-slate-400 mt-0.5 block">
+                      Auto-creates ID: 1st letters of first & last name + unique random number
+                    </span>
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block font-semibold text-slate-700">Guest ID</label>
+                      <button
+                        type="button"
+                        onClick={handleRollGuestId}
+                        title="Roll fresh unique random ID"
+                        className="text-[10px] font-semibold text-amber-800 hover:text-amber-950 flex items-center space-x-1 cursor-pointer bg-amber-50 hover:bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200 transition"
+                      >
+                        <Dices className="w-3 h-3 text-[#fdbe4e]" />
+                        <span>Roll</span>
+                      </button>
+                    </div>
+                    <input
+                      type="text"
+                      value={formData.guestId}
+                      onChange={e => setFormData(prev => ({ ...prev, guestId: e.target.value }))}
+                      placeholder="e.g. GN-4921"
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 font-mono font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Paid (USD $)</label>
-                  <input
-                    type="number"
-                    value={formData.paidAmount}
-                    onChange={e => {
-                      const paid = Number(e.target.value) || 0;
-                      setFormData(prev => ({
-                        ...prev,
-                        paidAmount: paid,
-                        balanceDue: Math.max(0, prev.totalAmount - paid)
-                      }));
-                    }}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  />
+
+                {/* Email & Phone */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Email Address</label>
+                    <input
+                      type="email"
+                      value={formData.email}
+                      onChange={e => setFormData(prev => ({ ...prev, email: e.target.value }))}
+                      placeholder="e.g. guest@example.com"
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Phone Number</label>
+                    <input
+                      type="tel"
+                      value={formData.phone}
+                      onChange={e => setFormData(prev => ({ ...prev, phone: e.target.value }))}
+                      placeholder="e.g. 255756200540"
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
                 </div>
+
+                {/* Dates */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Check-in *</label>
+                    <input
+                      type="date"
+                      required
+                      value={formData.checkIn}
+                      onChange={e => handleDateChange(e.target.value, formData.checkOut)}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Check-out *</label>
+                    <input
+                      type="date"
+                      required
+                      value={formData.checkOut}
+                      onChange={e => handleDateChange(formData.checkIn, e.target.value)}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Nights</label>
+                    <input
+                      type="number"
+                      readOnly
+                      value={formData.nights}
+                      className="w-full bg-slate-100 border border-[#e8e4dc] rounded-xl px-3 py-2 font-bold text-slate-700"
+                    />
+                  </div>
+                </div>
+
+                {/* Dynamic Room & Bed Code with Available-Only Filtering to Prevent Conflicts */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block font-semibold text-slate-700">Room Category *</label>
+                      <span className="text-[10px] text-emerald-700 font-semibold">Available Rooms Only</span>
+                    </div>
+                    <select
+                      value={formData.room}
+                      onChange={e => {
+                        const roomName = e.target.value;
+                        const avail = modalAvailability[roomName];
+                        const firstAvailableBed = avail?.availableBeds[0]?.id;
+                        const roomObj = HOSTEL_ROOMS.find(r => roomName.includes(r.name));
+                        const defaultBed = firstAvailableBed || roomObj?.units[0]?.id || '';
+                        setFormData(prev => ({
+                          ...prev,
+                          room: roomName,
+                          bedCode: defaultBed
+                        }));
+                      }}
+                      disabled={availableRooms.length === 0}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] disabled:opacity-60"
+                    >
+                      {availableRooms.length === 0 ? (
+                        <option value="" disabled>No rooms available for selected dates</option>
+                      ) : (
+                        availableRooms.map(room => {
+                          const fullName = `${room.name} (${room.roomCode})`;
+                          const avail = modalAvailability[fullName] || modalAvailability[room.name];
+                          const freeCount = avail?.availableBedsCount ?? room.capacity;
+                          return (
+                            <option key={room.id} value={fullName}>
+                              {fullName} • ({freeCount} of {room.capacity} beds available)
+                            </option>
+                          );
+                        })
+                      )}
+                    </select>
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block font-semibold text-slate-700">Available Bed Code *</label>
+                      <span className="text-[10px] text-emerald-700 font-semibold">Unoccupied Beds Only</span>
+                    </div>
+                    <select
+                      value={formData.bedCode}
+                      onChange={e => setFormData(prev => ({ ...prev, bedCode: e.target.value }))}
+                      disabled={availableRooms.length === 0 || !formData.room}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e] disabled:opacity-60"
+                    >
+                      {(() => {
+                        const avail = modalAvailability[formData.room];
+                        const availableBeds = avail?.availableBeds || [];
+                        if (availableBeds.length === 0) {
+                          return <option value="" disabled>No beds available in this room for these dates</option>;
+                        }
+                        return availableBeds.map(u => (
+                          <option key={u.id} value={u.id}>
+                            {u.id} — {u.place} (Available)
+                          </option>
+                        ));
+                      })()}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Bed Occupancy Note if other beds in the room are occupied */}
+                {(() => {
+                  const avail = modalAvailability[formData.room];
+                  if (avail && avail.occupiedBeds.length > 0) {
+                    return (
+                      <div className="p-2.5 bg-amber-50/80 border border-amber-200 rounded-xl text-[11px] text-amber-900 flex items-start space-x-2">
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600 mt-0.5 shrink-0" />
+                        <div>
+                          <span className="font-semibold">Occupied in {formData.room} for selected dates:</span>{' '}
+                          {avail.occupiedBeds.map(b => `${b.id} (${b.guestName} until ${b.checkOut})`).join(', ')}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return null;
+                })()}
+
+                {/* Total & Paid */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Total (USD $)</label>
+                    <input
+                      type="number"
+                      value={formData.totalAmount}
+                      onChange={e => {
+                        const total = Number(e.target.value) || 0;
+                        setFormData(prev => ({
+                          ...prev,
+                          totalAmount: total,
+                          balanceDue: Math.max(0, total - prev.paidAmount)
+                        }));
+                      }}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Paid (USD $)</label>
+                    <input
+                      type="number"
+                      value={formData.paidAmount}
+                      onChange={e => {
+                        const paid = Number(e.target.value) || 0;
+                        setFormData(prev => ({
+                          ...prev,
+                          paidAmount: paid,
+                          balanceDue: Math.max(0, prev.totalAmount - paid)
+                        }));
+                      }}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Balance Due</label>
+                    <input
+                      type="number"
+                      readOnly
+                      value={formData.balanceDue}
+                      className="w-full bg-rose-50 border border-rose-200 text-rose-800 font-bold rounded-xl px-3 py-2"
+                    />
+                  </div>
+                </div>
+
+                {/* Status, Platform, Currency & Notes */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Status</label>
+                    <select
+                      value={formData.status}
+                      onChange={e => setFormData(prev => ({ ...prev, status: e.target.value }))}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    >
+                      <option value="Confirmed">Confirmed</option>
+                      <option value="Checked-in">Checked-in</option>
+                      <option value="Checked-out">Checked-out</option>
+                      <option value="Tentative">Tentative</option>
+                      <option value="Cancelled">Cancelled</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Platform / Source</label>
+                    <select
+                      value={formData.platform}
+                      onChange={e => setFormData(prev => ({ ...prev, platform: e.target.value }))}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    >
+                      <option value="Direct Booking">Direct Booking</option>
+                      <option value="Website">Website</option>
+                      <option value="Airbnb">Airbnb</option>
+                      <option value="Booking.com">Booking.com</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Currency</label>
+                    <select
+                      value={formData.currency}
+                      onChange={e => setFormData(prev => ({ ...prev, currency: e.target.value as 'TZS' | 'USD' }))}
+                      className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                    >
+                      <option value="USD">USD ($)</option>
+                      <option value="TZS">TZS (Shillings)</option>
+                    </select>
+                  </div>
+                </div>
+
                 <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Balance Due</label>
+                  <label className="block font-semibold text-slate-700 mb-1">Notes / Requests / Airport Pickup</label>
                   <input
-                    type="number"
-                    readOnly
-                    value={formData.balanceDue}
-                    className="w-full bg-rose-50 border border-rose-200 text-rose-800 font-bold rounded-xl px-3 py-2"
+                    type="text"
+                    value={formData.notes}
+                    onChange={e => setFormData(prev => ({ ...prev, notes: e.target.value }))}
+                    placeholder="e.g. Needs airport pickup, climbing Kilimanjaro"
+                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
                   />
                 </div>
               </div>
 
-              {/* Status, Platform, Currency & Notes */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Status</label>
-                  <select
-                    value={formData.status}
-                    onChange={e => setFormData(prev => ({ ...prev, status: e.target.value }))}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  >
-                    <option value="Confirmed">Confirmed</option>
-                    <option value="Checked-in">Checked-in</option>
-                    <option value="Checked-out">Checked-out</option>
-                    <option value="Tentative">Tentative</option>
-                    <option value="Cancelled">Cancelled</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Platform / Source</label>
-                  <select
-                    value={formData.platform}
-                    onChange={e => setFormData(prev => ({ ...prev, platform: e.target.value }))}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  >
-                    <option value="Direct Booking">Direct Booking</option>
-                    <option value="Website">Website</option>
-                    <option value="Airbnb">Airbnb</option>
-                    <option value="Booking.com">Booking.com</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Currency</label>
-                  <select
-                    value={formData.currency}
-                    onChange={e => setFormData(prev => ({ ...prev, currency: e.target.value as 'TZS' | 'USD' }))}
-                    className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                  >
-                    <option value="USD">USD ($)</option>
-                    <option value="TZS">TZS (Shillings)</option>
-                  </select>
-                </div>
-              </div>
-
-              <div>
-                <label className="block font-semibold text-slate-700 mb-1">Notes / Requests / Airport Pickup</label>
-                <input
-                  type="text"
-                  value={formData.notes}
-                  onChange={e => setFormData(prev => ({ ...prev, notes: e.target.value }))}
-                  placeholder="e.g. Needs airport pickup, climbing Kilimanjaro"
-                  className="w-full bg-[#faf8f5] border border-[#e8e4dc] rounded-xl px-3 py-2 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
-                />
-              </div>
-
-              {/* Form Actions */}
-              <div className="pt-4 border-t border-[#f1ede4] flex items-center justify-between">
+              {/* Pinned Responsive Form Actions Footer */}
+              <div className="px-5 sm:px-6 py-3.5 border-t border-[#f1ede4] bg-[#faf8f5] flex items-center justify-between shrink-0">
                 {editingBooking ? (
                   <button
                     type="button"
@@ -6236,8 +6945,15 @@ export default function App() {
                   </button>
                   <button
                     type="submit"
-                    disabled={isSyncing}
-                    className="px-5 py-2 text-xs font-bold text-[#0d1726] bg-[#fdbe4e] hover:bg-[#ebb043] rounded-xl shadow-xs transition cursor-pointer flex items-center space-x-1.5 disabled:opacity-50"
+                    disabled={isSyncing || availableRooms.length === 0 || !formData.bedCode || !!formConflict}
+                    title={
+                      formConflict
+                        ? formConflict.description
+                        : availableRooms.length === 0
+                        ? 'No rooms available for selected dates'
+                        : 'Save and synchronize booking'
+                    }
+                    className="px-5 py-2 text-xs font-bold text-[#0d1726] bg-[#fdbe4e] hover:bg-[#ebb043] rounded-xl shadow-xs transition cursor-pointer flex items-center space-x-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {isSyncing && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
                     <span>{isSyncing ? 'Syncing...' : 'Save & Sync to Sheet'}</span>
@@ -6245,6 +6961,221 @@ export default function App() {
                 </div>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* BOOKING CONFLICT INSPECTOR & RESOLVER MODAL */}
+      {isConflictModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs overflow-y-auto p-2 sm:p-4 flex justify-center items-start sm:items-center">
+          <div className="relative bg-white rounded-2xl max-w-2xl w-full shadow-2xl border border-[#e8e4dc] my-2 sm:my-8 flex flex-col max-h-[calc(100dvh-1rem)] sm:max-h-[90vh] overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            {/* Header with Close Button */}
+            <div className="flex items-center justify-between px-5 sm:px-6 py-4 border-b border-[#f1ede4] bg-white shrink-0 z-10">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center font-bold shrink-0">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-bold text-slate-900 leading-tight">
+                    Booking Conflict Inspector & Alerts
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Real-time detection for double bookings, whole-room collisions & date overlaps
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsConflictModalOpen(false)}
+                aria-label="Close conflict inspector"
+                title="Close"
+                className="w-10 h-10 sm:w-9 sm:h-9 flex items-center justify-center text-slate-500 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-xl transition cursor-pointer shrink-0 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="overflow-y-auto p-4 sm:p-6 space-y-4 text-xs overscroll-contain flex-1">
+              {conflicts.length === 0 ? (
+                <div className="py-12 px-4 text-center">
+                  <div className="w-14 h-14 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto mb-3 border border-emerald-200 shadow-2xs">
+                    <CheckCircle2 className="w-7 h-7" />
+                  </div>
+                  <h4 className="text-base font-bold text-slate-800">Zero Booking Conflicts!</h4>
+                  <p className="text-xs text-slate-500 max-w-sm mx-auto mt-1">
+                    All guest reservations currently have verified, non-overlapping beds and conflict-free check-in/out dates.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between pb-1">
+                    <span className="font-semibold text-slate-700">
+                      {conflicts.length} Active Conflict{conflicts.length > 1 ? 's' : ''} Found:
+                    </span>
+                    <span className="text-[11px] text-rose-700 font-bold bg-rose-50 px-2.5 py-0.5 rounded-full border border-rose-200">
+                      Immediate Action Required
+                    </span>
+                  </div>
+
+                  {conflicts.map(conflict => (
+                    <div
+                      key={conflict.id}
+                      className="border border-rose-200 bg-rose-50/40 rounded-2xl p-4 space-y-3"
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-2.5 border-b border-rose-200/60">
+                        <div className="flex items-center space-x-2">
+                          <span className="px-2 py-0.5 rounded-md bg-rose-600 text-white font-bold text-[10px] uppercase tracking-wider">
+                            {conflict.type === 'double_booking' ? 'Double Booking' : conflict.type === 'whole_room_collision' ? 'Whole Room Collision' : 'Date Error'}
+                          </span>
+                          <span className="font-bold text-slate-900 text-xs sm:text-sm">
+                            {conflict.room} • Bed {conflict.bedCode}
+                          </span>
+                        </div>
+                        <span className="text-[11px] font-mono text-rose-800 bg-rose-100 px-2 py-0.5 rounded-md self-start sm:self-auto font-medium">
+                          Overlap: {conflict.overlapStart} to {conflict.overlapEnd} ({conflict.overlappingNights} night{conflict.overlappingNights === 1 ? '' : 's'})
+                        </span>
+                      </div>
+
+                      <p className="text-xs text-slate-700 leading-relaxed font-medium">
+                        {conflict.description}
+                      </p>
+
+                      {/* Conflicting Reservations Comparison Cards */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                        {/* Reservation A */}
+                        <div className="bg-white p-3.5 rounded-xl border border-[#e8e4dc] shadow-2xs space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="font-mono font-bold text-slate-900 text-xs">{conflict.reservationA.id}</span>
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[10px] font-semibold">
+                              {conflict.reservationA.status}
+                            </span>
+                          </div>
+                          <div>
+                            <div className="font-bold text-slate-900 text-sm">{conflict.reservationA.guestName}</div>
+                            <div className="text-[11px] text-slate-500 mt-0.5">
+                              {conflict.reservationA.checkIn} &rarr; {conflict.reservationA.checkOut}
+                            </div>
+                            <div className="text-[11px] text-slate-600 mt-1">
+                              Bed: <span className="font-mono font-semibold text-slate-900">{conflict.reservationA.bedCode || conflict.reservationA.unitId}</span> • Total ${conflict.reservationA.totalAmount}
+                            </div>
+                          </div>
+                          <div className="pt-2.5 border-t border-slate-100 flex items-center space-x-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsConflictModalOpen(false);
+                                handleOpenEditModal(conflict.reservationA);
+                              }}
+                              className="px-2.5 py-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-slate-950 font-bold rounded-lg text-[11px] transition cursor-pointer flex-1 text-center shadow-2xs"
+                            >
+                              Reassign / Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmModal({
+                                  isOpen: true,
+                                  title: `Cancel Booking ${conflict.reservationA.id}?`,
+                                  message: `Are you sure you want to cancel ${conflict.reservationA.guestName}'s booking to resolve this conflict?`,
+                                  onConfirm: async () => {
+                                    setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                                    const updated = { ...conflict.reservationA, status: 'Cancelled' };
+                                    try {
+                                      await saveReservationToSheet(updated, false);
+                                      try { await saveReservationToFirestore(updated); } catch (e) {}
+                                      setReservations(prev => prev.map(r => r.id === updated.id ? updated : r));
+                                      triggerToast(`Cancelled ${conflict.reservationA.id} to resolve conflict`, 'success');
+                                    } catch (err: any) {
+                                      triggerToast(`Failed to cancel: ${err.message}`, 'error');
+                                    }
+                                  }
+                                });
+                              }}
+                              className="px-2.5 py-1.5 text-rose-600 hover:bg-rose-50 rounded-lg text-[11px] font-semibold transition cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Reservation B */}
+                        {conflict.reservationB && (
+                          <div className="bg-white p-3.5 rounded-xl border border-[#e8e4dc] shadow-2xs space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="font-mono font-bold text-slate-900 text-xs">{conflict.reservationB.id}</span>
+                              <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[10px] font-semibold">
+                                {conflict.reservationB.status}
+                              </span>
+                            </div>
+                            <div>
+                              <div className="font-bold text-slate-900 text-sm">{conflict.reservationB.guestName}</div>
+                              <div className="text-[11px] text-slate-500 mt-0.5">
+                                {conflict.reservationB.checkIn} &rarr; {conflict.reservationB.checkOut}
+                              </div>
+                              <div className="text-[11px] text-slate-600 mt-1">
+                                Bed: <span className="font-mono font-semibold text-slate-900">{conflict.reservationB.bedCode || conflict.reservationB.unitId}</span> • Total ${conflict.reservationB.totalAmount}
+                              </div>
+                            </div>
+                            <div className="pt-2.5 border-t border-slate-100 flex items-center space-x-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsConflictModalOpen(false);
+                                  handleOpenEditModal(conflict.reservationB!);
+                                }}
+                                className="px-2.5 py-1.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-slate-950 font-bold rounded-lg text-[11px] transition cursor-pointer flex-1 text-center shadow-2xs"
+                              >
+                                Reassign / Edit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setConfirmModal({
+                                    isOpen: true,
+                                    title: `Cancel Booking ${conflict.reservationB!.id}?`,
+                                    message: `Are you sure you want to cancel ${conflict.reservationB!.guestName}'s booking to resolve this conflict?`,
+                                    onConfirm: async () => {
+                                      setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                                      const updated = { ...conflict.reservationB!, status: 'Cancelled' };
+                                      try {
+                                        await saveReservationToSheet(updated, false);
+                                        try { await saveReservationToFirestore(updated); } catch (e) {}
+                                        setReservations(prev => prev.map(r => r.id === updated.id ? updated : r));
+                                        triggerToast(`Cancelled ${conflict.reservationB!.id} to resolve conflict`, 'success');
+                                      } catch (err: any) {
+                                        triggerToast(`Failed to cancel: ${err.message}`, 'error');
+                                      }
+                                    }
+                                  });
+                                }}
+                                className="px-2.5 py-1.5 text-rose-600 hover:bg-rose-50 rounded-lg text-[11px] font-semibold transition cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-5 sm:px-6 py-3.5 border-t border-[#f1ede4] bg-[#faf8f5] flex items-center justify-between shrink-0">
+              <span className="text-xs text-slate-400">
+                {conflicts.length > 0 ? `${conflicts.length} conflict(s) pending resolution` : 'All bookings verified conflict-free'}
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsConflictModalOpen(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-white border border-[#e8e4dc] hover:bg-slate-50 rounded-xl transition cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -6866,6 +7797,560 @@ export default function App() {
         </div>
       )}
 
+      {/* ============================================================== */}
+      {/* 1. TOP-CENTER NOTIFICATIONS & ACTION CENTER POP UP             */}
+      {/* ============================================================== */}
+      {isNotificationsOpen && (
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setIsNotificationsOpen(false);
+          }}
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-start justify-center p-3 sm:p-4 pt-14 sm:pt-20 overflow-y-auto"
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl border border-[#e8e4dc] w-full max-w-md overflow-hidden animate-in fade-in zoom-in-95 duration-200"
+          >
+            {/* Header */}
+            <div className="p-4 bg-[#0d1726] text-white flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-8 h-8 rounded-lg bg-[#fdbe4e]/20 text-[#fdbe4e] flex items-center justify-center">
+                  <Bell className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center space-x-2">
+                    <span className="font-bold text-sm">Action Center & Alerts</span>
+                    <span className="bg-[#fdbe4e]/25 text-[#fdbe4e] text-[10px] px-2 py-0.5 rounded font-mono font-bold">
+                      {actionItems.length + conflicts.length}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400">Important hostel operations & notifications</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsNotificationsOpen(false)}
+                className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-white/10 transition cursor-pointer"
+                title="Close notifications"
+                aria-label="Close notifications"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Critical Booking Conflict Alert Banner if any conflict exists */}
+            {conflicts.length > 0 && (
+              <div className="p-3.5 bg-rose-50 border-b border-rose-200 flex items-center justify-between gap-3">
+                <div className="flex items-center space-x-2.5 text-rose-950 text-xs min-w-0">
+                  <div className="w-7 h-7 rounded-lg bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
+                    <AlertTriangle className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <span className="font-bold text-rose-900 block truncate">
+                      {conflicts.length} Booking Conflict{conflicts.length > 1 ? 's' : ''} Detected
+                    </span>
+                    <p className="text-[10px] text-rose-700 truncate">Overlapping bed assignments require resolution</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsNotificationsOpen(false);
+                    setIsConflictModalOpen(true);
+                  }}
+                  className="px-2.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer shrink-0"
+                >
+                  Resolve Now &rarr;
+                </button>
+              </div>
+            )}
+
+            {/* Notifications / Action Items List */}
+            <div className="max-h-96 overflow-y-auto divide-y divide-[#f2ede4]">
+              {actionItems.length === 0 && conflicts.length === 0 ? (
+                <div className="p-8 text-center">
+                  <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto mb-2" />
+                  <p className="text-sm font-bold text-slate-800">All caught up!</p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    No critical warnings, overlapping bookings, or pending guest actions.
+                  </p>
+                </div>
+              ) : (
+                actionItems.map(item => (
+                  <div
+                    key={item.id}
+                    onClick={() => {
+                      if (item.booking) {
+                        handleOpenEditModal(item.booking);
+                      } else if (item.id.startsWith('conflict-')) {
+                        setIsConflictModalOpen(true);
+                      }
+                      setIsNotificationsOpen(false);
+                    }}
+                    className="p-3.5 hover:bg-[#faf8f5] transition cursor-pointer flex items-start space-x-3 text-left group"
+                  >
+                    <div className="mt-0.5 shrink-0">
+                      {item.severity === 'high' || item.type === 'mismatch' ? (
+                        <div className="w-7 h-7 rounded-lg bg-rose-100 text-rose-600 flex items-center justify-center">
+                          <AlertTriangle className="w-4 h-4" />
+                        </div>
+                      ) : item.type === 'checkin' ? (
+                        <div className="w-7 h-7 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center">
+                          <Users className="w-4 h-4" />
+                        </div>
+                      ) : item.type === 'payment' ? (
+                        <div className="w-7 h-7 rounded-lg bg-amber-100 text-amber-700 flex items-center justify-center">
+                          <CreditCard className="w-4 h-4" />
+                        </div>
+                      ) : (
+                        <div className="w-7 h-7 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center">
+                          <Sparkles className="w-4 h-4" />
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-bold text-slate-900 leading-tight group-hover:text-amber-950 transition">
+                        {item.title}
+                      </p>
+                      <p className="text-[11px] text-slate-500 mt-0.5 line-clamp-2 leading-relaxed">
+                        {item.description}
+                      </p>
+                      <div className="mt-1 flex items-center space-x-1.5 text-[10px] text-amber-700 font-semibold">
+                        <span>Take action &rarr;</span>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {(actionItems.length > 0 || conflicts.length > 0) && (
+              <div className="p-2.5 bg-[#fbf9f5] border-t border-[#f1ede4] text-center">
+                <p className="text-[10px] text-slate-400">
+                  Click any notification to open booking folio or resolve conflict
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
+      {/* 2. DEDICATED MOBILE SEARCH POP UP                              */}
+      {/* ============================================================== */}
+      {isMobileSearchOpen && (
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setIsMobileSearchOpen(false);
+          }}
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-start justify-center p-3 sm:p-4 pt-10 sm:pt-16 overflow-y-auto"
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl border border-[#e8e4dc] w-full max-w-lg overflow-hidden flex flex-col max-h-[85vh] animate-in fade-in zoom-in-95 duration-200"
+          >
+            {/* Top Search Input Bar */}
+            <div className="p-3.5 border-b border-[#f1ede4] bg-[#faf8f5] flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-3 pointer-events-none" />
+                <input
+                  type="text"
+                  autoFocus
+                  value={globalSearch}
+                  onChange={e => setGlobalSearch(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && globalSearch.trim()) {
+                      addRecentSearch({ query: globalSearch.trim(), type: 'search' });
+                      setIsMobileSearchOpen(false);
+                      setActiveTab('bookings');
+                    } else if (e.key === 'Escape') {
+                      setIsMobileSearchOpen(false);
+                    }
+                  }}
+                  placeholder="Search guest name, booking ID, room, phone..."
+                  className="w-full bg-white border border-[#e5dfd3] rounded-xl pl-9 pr-9 py-2.5 text-xs text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#fdbe4e]"
+                />
+                {globalSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setGlobalSearch('')}
+                    className="absolute right-2.5 top-2.5 p-1 text-slate-400 hover:text-slate-600 rounded-md transition cursor-pointer"
+                    title="Clear search input"
+                    aria-label="Clear search input"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsMobileSearchOpen(false)}
+                className="px-3 py-2 text-xs font-semibold text-slate-600 hover:text-slate-900 bg-white border border-[#e8e4dc] rounded-xl transition cursor-pointer shrink-0"
+              >
+                Close
+              </button>
+            </div>
+
+            {/* Popup Body */}
+            <div className="overflow-y-auto p-3 flex-1 divide-y divide-[#f7f5f0]">
+              {!globalSearch.trim() ? (
+                /* Recent Searches & Quick History */
+                <div>
+                  <div className="flex items-center justify-between pb-2 px-1 text-xs font-semibold text-slate-700">
+                    <div className="flex items-center space-x-1.5">
+                      <History className="w-3.5 h-3.5 text-amber-600" />
+                      <span>Recent Searches & Frequently Viewed</span>
+                    </div>
+                    {recentSearches.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={clearAllRecentSearches}
+                        className="text-[11px] text-slate-400 hover:text-rose-600 font-medium cursor-pointer"
+                      >
+                        Clear All
+                      </button>
+                    )}
+                  </div>
+                  {recentSearches.length === 0 ? (
+                    <div className="p-8 text-center">
+                      <Clock className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                      <p className="text-xs font-bold text-slate-700">No search history yet</p>
+                      <p className="text-[11px] text-slate-400 mt-1 max-w-xs mx-auto">
+                        Type a guest name, room number, or booking ID above to search and see live results.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-[#f7f5f0]">
+                      {recentSearches.map(item => (
+                        <div
+                          key={item.id}
+                          onClick={() => {
+                            setGlobalSearch(item.query);
+                            setIsMobileSearchOpen(false);
+                            setActiveTab('bookings');
+                            if (item.bookingId) {
+                              const found = reservations.find(r => r.id === item.bookingId);
+                              if (found && (isAdmin || isPropertyManager)) {
+                                handleOpenEditModal(found);
+                              }
+                            }
+                          }}
+                          className="py-2.5 px-2 hover:bg-[#faf8f5] rounded-xl flex items-center justify-between transition cursor-pointer"
+                        >
+                          <div className="flex items-center space-x-2.5 min-w-0 flex-1">
+                            <div className="w-7 h-7 rounded-lg bg-amber-50 text-amber-800 flex items-center justify-center shrink-0">
+                              {item.type === 'guest_record' ? <Users className="w-3.5 h-3.5" /> : <Clock className="w-3.5 h-3.5" />}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center space-x-1.5">
+                                <span className="text-xs font-bold text-slate-900 truncate">
+                                  {item.guestName || item.query}
+                                </span>
+                                {item.bookingId && (
+                                  <span className="text-[10px] font-mono text-amber-900 bg-amber-50 px-1 rounded border border-amber-200">
+                                    {item.bookingId}
+                                  </span>
+                                )}
+                              </div>
+                              {(item.room || item.dates) && (
+                                <div className="text-[10px] text-slate-400 truncate mt-0.5">
+                                  {item.room} {item.bedCode && `· Bed ${item.bedCode}`} {item.dates && `· ${item.dates}`}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={e => removeRecentSearch(item.id, e)}
+                            className="p-1 text-slate-400 hover:text-rose-600 rounded-md"
+                            title="Remove search entry"
+                            aria-label="Remove search entry"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                /* Active Search Results */
+                <div>
+                  <div className="pb-2 px-1 text-[11px] font-bold uppercase tracking-wider text-slate-400 flex items-center justify-between">
+                    <span>Matching Reservations ({matchingReservations.length})</span>
+                    <span className="text-amber-700 font-semibold lowercase text-xs">Tap to view folio</span>
+                  </div>
+                  {matchingReservations.length === 0 ? (
+                    <div className="p-8 text-center">
+                      <AlertCircle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                      <p className="text-xs font-bold text-slate-700">No matching reservations found</p>
+                      <p className="text-[11px] text-slate-400 mt-1">
+                        Try searching by guest name, room name, phone number, or booking ID.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-[#f7f5f0]">
+                      {matchingReservations.map(res => (
+                        <div
+                          key={res.id}
+                          onClick={() => {
+                            addRecentSearch({
+                              query: res.guestName,
+                              type: 'guest_record',
+                              bookingId: res.id,
+                              guestName: res.guestName,
+                              room: res.room,
+                              bedCode: res.unitId || res.bedCode,
+                              dates: `${res.checkIn} to ${res.checkOut}`,
+                              status: res.status
+                            });
+                            setGlobalSearch(res.guestName);
+                            setIsMobileSearchOpen(false);
+                            setActiveTab('bookings');
+                            if (isAdmin || isPropertyManager) {
+                              handleOpenEditModal(res);
+                            }
+                          }}
+                          className="py-2.5 px-2 hover:bg-[#faf8f5] rounded-xl flex items-center justify-between gap-2 transition cursor-pointer"
+                        >
+                          <div className="flex items-center space-x-2.5 min-w-0 flex-1">
+                            <div className="w-8 h-8 rounded-lg bg-amber-50 text-amber-800 flex items-center justify-center shrink-0">
+                              <Users className="w-4 h-4" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center space-x-1.5">
+                                <span className="text-xs font-bold text-slate-900 truncate">{res.guestName}</span>
+                                <span className="text-[10px] font-mono text-slate-400">({res.id})</span>
+                              </div>
+                              <div className="text-[10px] text-slate-500 mt-0.5 truncate">
+                                {res.room} · Bed {res.bedCode || res.unitId} · {res.checkIn} to {res.checkOut}
+                              </div>
+                            </div>
+                          </div>
+                          <span className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded shrink-0">
+                            {res.status}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Filter all bookings button */}
+                  <div className="pt-3 mt-3 border-t border-[#f1ede4]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addRecentSearch({ query: globalSearch.trim(), type: 'search' });
+                        setIsMobileSearchOpen(false);
+                        setActiveTab('bookings');
+                      }}
+                      className="w-full py-2.5 bg-[#fdbe4e] hover:bg-[#ebb043] text-[#0d1726] font-bold text-xs rounded-xl shadow-xs transition flex items-center justify-center space-x-2 cursor-pointer"
+                    >
+                      <Search className="w-3.5 h-3.5" />
+                      <span>Show all bookings matching &ldquo;{globalSearch}&rdquo;</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
+      {/* 3. CURRENCY SELECTION POP UP                                   */}
+      {/* ============================================================== */}
+      {isCurrencyModalOpen && (
+        <div 
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setIsCurrencyModalOpen(false);
+          }}
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+        >
+          <div className="bg-white rounded-2xl shadow-2xl border border-[#e8e4dc] w-full max-w-sm overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="p-4 bg-[#0d1726] text-white flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-8 h-8 rounded-lg bg-[#fdbe4e]/20 text-[#fdbe4e] flex items-center justify-center">
+                  <Coins className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold">Select Currency</h3>
+                  <p className="text-[11px] text-slate-400">Choose display & calculation currency</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsCurrencyModalOpen(false)}
+                className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-white/10 transition cursor-pointer"
+                title="Close currency selector"
+                aria-label="Close currency selector"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Currency Options */}
+            <div className="p-4 space-y-2.5">
+              {[
+                { code: 'USD', name: 'US Dollar', symbol: '$', rateDesc: 'Base Currency (1.00)' },
+                { code: 'TZS', name: 'Tanzanian Shilling', symbol: 'TZS', rateDesc: '~2,645 TZS per USD' },
+                { code: 'EUR', name: 'Euro', symbol: '€', rateDesc: '~0.92 EUR per USD' },
+                { code: 'GBP', name: 'British Pound', symbol: '£', rateDesc: '~0.79 GBP per USD' }
+              ].map(item => {
+                const isSelected = currency === item.code;
+                return (
+                  <button
+                    key={item.code}
+                    type="button"
+                    onClick={() => {
+                      setCurrency(item.code as any);
+                      try {
+                        localStorage.setItem('muh_currency_preference', item.code);
+                      } catch {}
+                      triggerToast(`Currency switched to ${item.name} (${item.code})`, 'success');
+                      setIsCurrencyModalOpen(false);
+                    }}
+                    className={`w-full p-3 rounded-xl border text-left flex items-center justify-between transition cursor-pointer ${
+                      isSelected
+                        ? 'bg-amber-50/70 border-[#fdbe4e] ring-2 ring-[#fdbe4e]/40 shadow-xs'
+                        : 'bg-white hover:bg-slate-50 border-[#e8e4dc]'
+                    }`}
+                  >
+                    <div className="flex items-center space-x-3">
+                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs shrink-0 ${
+                        isSelected ? 'bg-[#fdbe4e] text-[#0d1726]' : 'bg-slate-100 text-slate-600'
+                      }`}>
+                        {item.symbol}
+                      </div>
+                      <div>
+                        <div className="flex items-center space-x-1.5">
+                          <span className="text-xs font-bold text-slate-900">{item.name}</span>
+                          <span className="text-[10px] font-mono font-bold text-slate-500">({item.code})</span>
+                        </div>
+                        <p className="text-[10px] text-slate-400 mt-0.5">{item.rateDesc}</p>
+                      </div>
+                    </div>
+                    {isSelected ? (
+                      <div className="w-6 h-6 rounded-full bg-emerald-500 text-white flex items-center justify-center shrink-0">
+                        <Check className="w-3.5 h-3.5 stroke-[3]" />
+                      </div>
+                    ) : (
+                      <div className="w-5 h-5 rounded-full border border-slate-300 shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="p-3 bg-[#faf8f5] border-t border-[#f1ede4] text-center">
+              <p className="text-[10px] text-slate-400">
+                Conversion rates apply across all charts, reports and folios
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
+      {/* 4. MOBILE BOTTOM NAVIGATION DOCK                               */}
+      {/* ============================================================== */}
+      <nav
+        aria-label="Mobile Navigation Dock"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-[#e8e4dc] px-2 py-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] shadow-[0_-4px_20px_rgba(0,0,0,0.06)] select-none"
+      >
+        <div className="grid grid-cols-4 gap-1 max-w-md mx-auto">
+          {/* Item 1: Overview */}
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('overview');
+              setMobileSidebarOpen(false);
+            }}
+            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition cursor-pointer relative ${
+              activeTab === 'overview'
+                ? 'text-amber-900 font-bold'
+                : 'text-slate-500 hover:text-slate-800 font-medium'
+            }`}
+          >
+            <div className={`p-1 rounded-lg transition ${activeTab === 'overview' ? 'bg-[#fdbe4e]/25 text-amber-900' : ''}`}>
+              <Layers className="w-5 h-5" />
+            </div>
+            <span className="text-[10px] tracking-tight mt-0.5">Overview</span>
+            {arrivalsToday.length > 0 && (
+              <span className="absolute top-1 right-3 w-4 h-4 rounded-full bg-[#fdbe4e] text-[#0d1726] font-bold text-[9px] flex items-center justify-center shadow-xs">
+                {arrivalsToday.length}
+              </span>
+            )}
+          </button>
+
+          {/* Item 2: Bookings */}
+          <button
+            type="button"
+            onClick={() => {
+              if (isStaff) {
+                triggerToast('Staff accounts have view-only access to Overview & Availability', 'info');
+                return;
+              }
+              setActiveTab('bookings');
+              setMobileSidebarOpen(false);
+            }}
+            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition cursor-pointer relative ${
+              activeTab === 'bookings'
+                ? 'text-amber-900 font-bold'
+                : 'text-slate-500 hover:text-slate-800 font-medium'
+            }`}
+          >
+            <div className={`p-1 rounded-lg transition ${activeTab === 'bookings' ? 'bg-[#fdbe4e]/25 text-amber-900' : ''}`}>
+              <Calendar className="w-5 h-5" />
+            </div>
+            <span className="text-[10px] tracking-tight mt-0.5">Bookings</span>
+            {reservations.length > 0 && (
+              <span className="absolute top-1 right-2.5 text-[9px] font-mono px-1 py-0.2 rounded-full bg-slate-100 text-slate-600 font-semibold border border-slate-200">
+                {reservations.length}
+              </span>
+            )}
+          </button>
+
+          {/* Item 3: Availability */}
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('availability');
+              setMobileSidebarOpen(false);
+            }}
+            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'availability'
+                ? 'text-amber-900 font-bold'
+                : 'text-slate-500 hover:text-slate-800 font-medium'
+            }`}
+          >
+            <div className={`p-1 rounded-lg transition ${activeTab === 'availability' ? 'bg-[#fdbe4e]/25 text-amber-900' : ''}`}>
+              <Bed className="w-5 h-5" />
+            </div>
+            <span className="text-[10px] tracking-tight mt-0.5">Availability</span>
+          </button>
+
+          {/* Item 4: Settings (opens side panel) */}
+          <button
+            type="button"
+            onClick={() => {
+              setMobileSidebarOpen(true);
+            }}
+            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl transition cursor-pointer relative ${
+              mobileSidebarOpen || activeTab === 'admin' || activeTab === 'sheets' || activeTab === 'changelog' || activeTab === 'rooms'
+                ? 'text-amber-900 font-bold'
+                : 'text-slate-500 hover:text-slate-800 font-medium'
+            }`}
+          >
+            <div className={`p-1 rounded-lg transition ${mobileSidebarOpen ? 'bg-[#fdbe4e]/25 text-amber-900' : ''}`}>
+              <Settings className="w-5 h-5" />
+            </div>
+            <span className="text-[10px] tracking-tight mt-0.5">Settings</span>
+            {isAdmin && (
+              <span className="absolute top-1 right-3 w-2 h-2 rounded-full bg-[#fdbe4e]" />
+            )}
+          </button>
+        </div>
+      </nav>
     </div>
   );
 }
