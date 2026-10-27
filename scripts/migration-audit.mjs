@@ -47,8 +47,8 @@ const monthIndex = Object.fromEntries(['jan','feb','mar','apr','may','jun','jul'
 export function normalizeDate(raw){
   const text=String(raw??'').trim();
   if(!text)return '';
-  const iso=text.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})$/);
-  const named=text.match(/^(\\d{1,2})[ /-]([A-Za-z]{3,9})[ ,/-]+(\\d{4})$/);
+  const iso=text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  const named=text.match(/^(\d{1,2})[ /-]([A-Za-z]{3,9})[ ,/-]+(\d{4})$/);
   let y,m,d;
   if(iso){[,y,m,d]=iso; y=Number(y);m=Number(m);d=Number(d);}
   else if(named){d=Number(named[1]);m=monthIndex[named[2].slice(0,3).toLowerCase()];y=Number(named[3]);}
