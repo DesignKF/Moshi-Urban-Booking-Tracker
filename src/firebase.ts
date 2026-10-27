@@ -349,7 +349,7 @@ export async function fetchReservationsFromFirestore(): Promise<Reservation[]> {
 
 /**
  * Collision-free booking ID allocator:
- * Uses atomic sequence counter in Firestore transaction with high-entropy monotonic fallback
+ * Uses atomic sequence counter in Firestore transaction with database uniqueness verification
  */
 export async function allocateNextBookingId(existingReservations: Reservation[] = []): Promise<string> {
   const counterRef = doc(db, 'counters', 'booking_sequence');
@@ -367,31 +367,52 @@ export async function allocateNextBookingId(existingReservations: Reservation[] 
           if (!isNaN(num) && num >= nextNum) nextNum = num + 1;
         }
       }
+
+      // Check collision against actual reservations table in database
+      let candidateId = `MU-${nextNum}`;
+      let resSnap = await tx.get(doc(db, 'reservations', candidateId));
+      while (resSnap.exists()) {
+        nextNum++;
+        candidateId = `MU-${nextNum}`;
+        resSnap = await tx.get(doc(db, 'reservations', candidateId));
+      }
+
       tx.set(counterRef, {
         id: 'booking_sequence',
         lastNumber: nextNum,
         updatedAt: new Date().toISOString()
       }, { merge: true });
-      return `MU-${nextNum}`;
+      return candidateId;
     });
   } catch {
     // High-entropy monotonic fallback: guaranteed collision-free even if offline
     const timestampStr = Date.now().toString(36).toUpperCase();
-    const randPart = Math.floor(Math.random() * 900 + 100);
+    const randPart = Math.floor(Math.random() * 9000 + 1000);
     return `MU-${timestampStr}-${randPart}`;
   }
 }
 
+export interface InitialPaymentOption {
+  amount: number;
+  currency?: string;
+  method?: string;
+  notes?: string;
+  idempotencyKey?: string;
+}
+
 /**
  * Authoritative Firestore Transaction:
- * - Locks bed schedule documents inside runTransaction
- * - Checks every night in [checkIn, checkOut)
- * - Guarantees zero simultaneous double bookings
- * - Updates reservation and guest records
- * - Audits the change
- * - CRITICAL: Decoupled from payments! Does NOT create duplicate payment records.
+ * - Reads existing reservation footprint and union of all affected bed schedules in the Read Phase
+ * - Authoritatively checks for double bookings or whole-room collisions across all occupied nights
+ * - Atomically cleans up outdated allocations from previous beds/dates when modified or cancelled
+ * - Reserves all underlying physical beds for whole-room bookings
+ * - Prevents initial deposit double-counting: atomic reservation creation with optional initial deposit
+ * - Emits traceable audit records
  */
-export async function saveReservationToFirestore(res: Reservation): Promise<void> {
+export async function saveReservationToFirestore(
+  res: Reservation,
+  initialPayment?: InitialPaymentOption
+): Promise<void> {
   if (!auth.currentUser) {
     throw new Error('Authentication required: please sign in to save reservations.');
   }
@@ -412,28 +433,63 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
   const now = new Date().toISOString();
   const userEmail = auth.currentUser.email || 'system';
   const isCancelled = (res.status || '').toLowerCase().includes('cancel');
-  const nights = getNightsList(res.checkIn, res.checkOut);
-  const relatedBeds = getRelatedBedCodes(res.room, res.bedCode);
+
+  const newNights = getNightsList(res.checkIn, res.checkOut);
+  const newBeds = getRelatedBedCodes(res.room, res.bedCode);
 
   try {
     await runTransaction(db, async (tx) => {
-      // Step A: Read phase in transaction (all reads MUST precede writes in Firestore transactions)
-      const bedScheduleDocs = await Promise.all(
-        relatedBeds.map(bCode => tx.get(doc(db, 'bed_schedules', bCode)))
+      // Step A: Read Phase - All database reads MUST precede any writes in a Firestore transaction
+      const resDocRef = doc(db, 'reservations', res.id);
+      const existingResSnap = await tx.get(resDocRef);
+
+      let oldBeds: string[] = [];
+      let isNew = !existingResSnap.exists();
+      let canonicalPaid = 0;
+      let canonicalBalance = res.totalAmount || 0;
+
+      if (existingResSnap.exists()) {
+        const existingRes = existingResSnap.data() as Reservation;
+        oldBeds = getRelatedBedCodes(existingRes.room, existingRes.bedCode);
+        canonicalPaid = existingRes.paidAmount || 0;
+        canonicalBalance = Math.max(0, Math.round(((res.totalAmount ?? existingRes.totalAmount) - canonicalPaid + Number.EPSILON) * 100) / 100);
+      }
+
+      // Compute union of all affected bed schedules to read and lock
+      const allAffectedBeds = Array.from(new Set([...oldBeds, ...newBeds]));
+      const bedScheduleSnaps = await Promise.all(
+        allAffectedBeds.map(bCode => tx.get(doc(db, 'bed_schedules', bCode)))
       );
 
-      // Step B: Conflict verification across all occupied nights
-      if (!isCancelled) {
-        for (let i = 0; i < relatedBeds.length; i++) {
-          const bCode = relatedBeds[i];
-          const snap = bedScheduleDocs[i];
-          if (snap && snap.exists()) {
-            const sched = snap.data() as BedSchedule;
-            const allocations = sched.allocations || {};
+      const bedScheduleMap = new Map<string, BedSchedule>();
+      for (let i = 0; i < allAffectedBeds.length; i++) {
+        const snap = bedScheduleSnaps[i];
+        if (snap.exists()) {
+          bedScheduleMap.set(allAffectedBeds[i], snap.data() as BedSchedule);
+        }
+      }
 
-            for (const night of nights) {
-              const existingAlloc = allocations[night];
-              if (existingAlloc && existingAlloc.reservationId !== res.id && !existingAlloc.status.toLowerCase().includes('cancel')) {
+      // Check initial payment idempotency if requested
+      const paymentId = initialPayment
+        ? (initialPayment.idempotencyKey || `PAY-${res.id}-deposit`)
+        : null;
+      let existingPaySnap = null;
+      if (paymentId) {
+        existingPaySnap = await tx.get(doc(db, 'payments', paymentId));
+      }
+
+      // Step B: Conflict verification across all proposed nights on all proposed beds
+      if (!isCancelled) {
+        for (const bCode of newBeds) {
+          const sched = bedScheduleMap.get(bCode);
+          if (sched && sched.allocations) {
+            for (const night of newNights) {
+              const existingAlloc = sched.allocations[night];
+              if (
+                existingAlloc &&
+                existingAlloc.reservationId !== res.id &&
+                !existingAlloc.status.toLowerCase().includes('cancel')
+              ) {
                 throw new Error(
                   `Double-booking prevented: Bed ${bCode} is already booked on ${night} by ${existingAlloc.guestName} (${existingAlloc.reservationId}).`
                 );
@@ -443,49 +499,69 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
         }
       }
 
-      // Step C: Write phase in transaction
-      // 1. Update bed schedule allocations for primary bed
-      const primaryBedIndex = relatedBeds.indexOf(res.bedCode);
-      const primaryBedSnap = primaryBedIndex >= 0 ? bedScheduleDocs[primaryBedIndex] : null;
-      const currentAllocations = (primaryBedSnap && primaryBedSnap.exists())
-        ? (primaryBedSnap.data().allocations || {})
-        : {};
+      // Step C: Write Phase - Update bed schedules
+      // 1. For every affected bed, remove old allocations belonging to this reservation
+      for (const bCode of allAffectedBeds) {
+        const sched = bedScheduleMap.get(bCode) || { bedCode: bCode, room: res.room, allocations: {} };
+        const updatedAllocations: Record<string, any> = {};
 
-      // Clean up previous allocations for this reservation
-      const newAllocations: Record<string, any> = {};
-      for (const [dKey, alloc] of Object.entries(currentAllocations)) {
-        if (alloc && (alloc as any).reservationId !== res.id) {
-          newAllocations[dKey] = alloc;
+        for (const [dKey, alloc] of Object.entries(sched.allocations || {})) {
+          if (alloc && (alloc as any).reservationId !== res.id) {
+            updatedAllocations[dKey] = alloc;
+          }
         }
+
+        // If not cancelled and this bed is part of the new allocation footprint, write new allocations
+        if (!isCancelled && newBeds.includes(bCode)) {
+          for (const night of newNights) {
+            updatedAllocations[night] = {
+              reservationId: res.id,
+              guestName: res.guestName,
+              checkIn: res.checkIn,
+              checkOut: res.checkOut,
+              status: res.status
+            };
+          }
+        }
+
+        tx.set(doc(db, 'bed_schedules', bCode), {
+          bedCode: bCode,
+          room: res.room,
+          allocations: updatedAllocations,
+          updatedAt: now
+        }, { merge: true });
       }
 
-      // If active, record new date allocations
-      if (!isCancelled) {
-        for (const night of nights) {
-          newAllocations[night] = {
+      // 2. Handle initial payment atomically if creating a new booking with deposit
+      if (isNew && initialPayment && initialPayment.amount > 0 && paymentId) {
+        if (!existingPaySnap || !existingPaySnap.exists()) {
+          canonicalPaid = initialPayment.amount;
+          canonicalBalance = Math.max(0, Math.round((res.totalAmount - canonicalPaid + Number.EPSILON) * 100) / 100);
+
+          tx.set(doc(db, 'payments', paymentId), {
+            id: paymentId,
             reservationId: res.id,
-            guestName: res.guestName,
-            checkIn: res.checkIn,
-            checkOut: res.checkOut,
-            status: res.status
-          };
+            guestId: res.guestId || `GS-${res.id.replace(/\D/g, '').padStart(4, '0')}`,
+            amount: initialPayment.amount,
+            currency: initialPayment.currency || res.currency || 'USD',
+            type: canonicalBalance === 0 ? 'full' : 'deposit',
+            method: initialPayment.method || 'BookingPlatform',
+            recordedBy: userEmail,
+            notes: initialPayment.notes || `Initial deposit with new booking ${res.id}`,
+            createdAt: now
+          });
         }
       }
 
-      tx.set(doc(db, 'bed_schedules', res.bedCode), {
-        bedCode: res.bedCode,
-        room: res.room,
-        allocations: newAllocations,
-        updatedAt: now
-      }, { merge: true });
-
-      // 2. Write reservation document
-      tx.set(doc(db, 'reservations', res.id), {
+      // 3. Write reservation document with canonical financial balances
+      tx.set(resDocRef, {
         ...res,
+        paidAmount: canonicalPaid,
+        balanceDue: canonicalBalance,
         updatedAt: now
       }, { merge: true });
 
-      // 3. Write guest profile document
+      // 4. Write guest profile document
       const guestId = res.guestId || `GS-${res.id.replace(/\D/g, '').padStart(4, '0')}`;
       tx.set(doc(db, 'guests', guestId), {
         id: guestId,
@@ -497,16 +573,16 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
         updatedAt: now
       }, { merge: true });
 
-      // 4. Traceable Audit Log
+      // 5. Traceable Audit Log
       const auditId = `LOG-${res.id}-${Date.now()}`;
       tx.set(doc(db, 'audit_logs', auditId), {
         id: auditId,
-        action: 'save_reservation',
+        action: isNew ? 'create_reservation' : (isCancelled ? 'cancel_reservation' : 'update_reservation'),
         targetId: res.id,
         guestName: res.guestName,
         user: userEmail,
         timestamp: now,
-        diffSummary: `Saved ${res.id} for ${res.guestName} (${res.room} - ${res.bedCode})`
+        diffSummary: `${isNew ? 'Created' : 'Updated'} ${res.id} for ${res.guestName} (${res.room} - ${res.bedCode}, ${res.checkIn} to ${res.checkOut})`
       });
     });
 
@@ -517,9 +593,11 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
 
 /**
  * Authoritative Payment Transaction Recording:
- * - Dedicated, idempotent payment operations
+ * - Dedicated, idempotent financial operations
+ * - Reads both reservation and payment record in Read Phase
+ * - If identical payment exists, returns success idempotently without double-adjusting balances
+ * - Rejects conflicting payment records with same ID
  * - Atomically updates reservation paidAmount and balanceDue
- * - Creates payment transaction in /payments/{paymentId}
  */
 export async function recordPaymentTransaction(payment: PaymentTransaction): Promise<void> {
   if (!auth.currentUser) {
@@ -533,16 +611,38 @@ export async function recordPaymentTransaction(payment: PaymentTransaction): Pro
     throw new Error('Invalid payment: reservationId and positive amount are required.');
   }
 
-  const paymentId = payment.id || `PAY-${payment.reservationId}-${Date.now()}`;
+  const paymentId = payment.id || `PAY-${payment.reservationId}-${payment.type}-${Math.round(payment.amount * 100)}`;
   const now = new Date().toISOString();
   const userEmail = auth.currentUser.email || 'system';
 
   try {
     await runTransaction(db, async (tx) => {
       const resDocRef = doc(db, 'reservations', payment.reservationId);
-      const resSnap = await tx.get(resDocRef);
+      const payDocRef = doc(db, 'payments', paymentId);
+
+      // Read Phase
+      const [resSnap, paySnap] = await Promise.all([
+        tx.get(resDocRef),
+        tx.get(payDocRef)
+      ]);
+
       if (!resSnap.exists()) {
         throw new Error(`Cannot record payment: Reservation ${payment.reservationId} not found.`);
+      }
+
+      // Idempotency check:
+      if (paySnap.exists()) {
+        const existingPay = paySnap.data() as PaymentTransaction;
+        if (
+          existingPay.amount === payment.amount &&
+          existingPay.currency === (payment.currency || 'USD') &&
+          existingPay.type === payment.type &&
+          existingPay.reservationId === payment.reservationId
+        ) {
+          // Idempotent retry: return success without modifying balances again
+          return;
+        }
+        throw new Error(`Conflicting transaction details for payment ID ${paymentId}`);
       }
 
       const resData = resSnap.data() as Reservation;
@@ -556,13 +656,12 @@ export async function recordPaymentTransaction(payment: PaymentTransaction): Pro
       const updatedBalance = Math.max(0, Math.round((gross - updatedPaid + Number.EPSILON) * 100) / 100);
 
       // Write payment document
-      const payDocRef = doc(db, 'payments', paymentId);
       tx.set(payDocRef, {
         ...payment,
         id: paymentId,
         recordedBy: userEmail,
         createdAt: payment.createdAt || now
-      }, { merge: true });
+      });
 
       // Update reservation totals
       tx.update(resDocRef, {
@@ -580,7 +679,7 @@ export async function recordPaymentTransaction(payment: PaymentTransaction): Pro
         guestName: resData.guestName,
         user: userEmail,
         timestamp: now,
-        diffSummary: `${isRefund ? 'Refunded' : 'Recorded'} ${payment.currency} ${payment.amount} (${payment.type})`
+        diffSummary: `${isRefund ? 'Refunded' : 'Recorded'} ${payment.currency || 'USD'} ${payment.amount} (${payment.type})`
       });
     });
   } catch (error) {
@@ -653,23 +752,118 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
     throw new Error('Permission denied: only Administrators can delete reservations.');
   }
   const path = `reservations/${reservationId}`;
-  try {
-    const docRef = doc(db, 'reservations', reservationId);
-    await deleteDoc(docRef);
+  const now = new Date().toISOString();
+  const userEmail = auth.currentUser.email || 'admin';
 
-    // Audit log
-    const auditId = `LOG-DEL-${reservationId}-${Date.now()}`;
-    await setDoc(doc(db, 'audit_logs', auditId), {
-      id: auditId,
-      action: 'delete_reservation',
-      targetId: reservationId,
-      user: auth.currentUser.email || 'admin',
-      timestamp: new Date().toISOString(),
-      diffSummary: `Deleted reservation ${reservationId}`
-    }).catch(() => {});
+  try {
+    await runTransaction(db, async (tx) => {
+      const resDocRef = doc(db, 'reservations', reservationId);
+      const resSnap = await tx.get(resDocRef);
+      if (!resSnap.exists()) {
+        return; // Idempotent deletion
+      }
+
+      const res = resSnap.data() as Reservation;
+      const relatedBeds = getRelatedBedCodes(res.room, res.bedCode);
+      const schedSnaps = await Promise.all(
+        relatedBeds.map(bCode => tx.get(doc(db, 'bed_schedules', bCode)))
+      );
+
+      // Clean up allocations on all related beds
+      for (let i = 0; i < relatedBeds.length; i++) {
+        const bCode = relatedBeds[i];
+        const sSnap = schedSnaps[i];
+        if (sSnap.exists()) {
+          const sched = sSnap.data() as BedSchedule;
+          const updatedAllocations: Record<string, any> = {};
+          for (const [dKey, alloc] of Object.entries(sched.allocations || {})) {
+            if (alloc && (alloc as any).reservationId !== reservationId) {
+              updatedAllocations[dKey] = alloc;
+            }
+          }
+          tx.set(doc(db, 'bed_schedules', bCode), {
+            bedCode: bCode,
+            allocations: updatedAllocations,
+            updatedAt: now
+          }, { merge: true });
+        }
+      }
+
+      tx.delete(resDocRef);
+
+      const auditId = `LOG-DEL-${reservationId}-${Date.now()}`;
+      tx.set(doc(db, 'audit_logs', auditId), {
+        id: auditId,
+        action: 'delete_reservation',
+        targetId: reservationId,
+        user: userEmail,
+        timestamp: now,
+        diffSummary: `Deleted reservation ${reservationId} and released bed inventory`
+      });
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
+}
+
+/**
+ * Rebuilds and reconciles bed schedules from canonical Firestore reservations.
+ * Flags any historical overlapping assignments and writes coherent bed_schedules.
+ */
+export async function rebuildBedSchedulesFromReservations(): Promise<{
+  processedReservations: number;
+  populatedBeds: number;
+  historicalConflicts: string[];
+}> {
+  const allReservations = await fetchReservationsFromFirestore();
+  const activeReservations = allReservations.filter(r => {
+    const st = (r.status || '').toLowerCase();
+    return !st.includes('cancel') && r.checkIn && r.checkOut && r.checkIn < r.checkOut;
+  });
+
+  const bedAllocationsMap = new Map<string, Record<string, any>>();
+  const conflicts: string[] = [];
+
+  for (const res of activeReservations) {
+    const beds = getRelatedBedCodes(res.room, res.bedCode);
+    const nights = getNightsList(res.checkIn, res.checkOut);
+
+    for (const bCode of beds) {
+      if (!bedAllocationsMap.has(bCode)) {
+        bedAllocationsMap.set(bCode, {});
+      }
+      const allocs = bedAllocationsMap.get(bCode)!;
+
+      for (const night of nights) {
+        if (allocs[night] && allocs[night].reservationId !== res.id) {
+          conflicts.push(`Historical conflict on bed ${bCode} (${night}): ${allocs[night].reservationId} vs ${res.id}`);
+        }
+        allocs[night] = {
+          reservationId: res.id,
+          guestName: res.guestName,
+          checkIn: res.checkIn,
+          checkOut: res.checkOut,
+          status: res.status
+        };
+      }
+    }
+  }
+
+  // Persist reconstructed schedules to Firestore
+  const now = new Date().toISOString();
+  for (const [bCode, allocations] of bedAllocationsMap.entries()) {
+    await setDoc(doc(db, 'bed_schedules', bCode), {
+      bedCode: bCode,
+      allocations,
+      updatedAt: now
+    }, { merge: true });
+  }
+
+  return {
+    processedReservations: activeReservations.length,
+    populatedBeds: bedAllocationsMap.size,
+    historicalConflicts: conflicts
+  };
 }
 
 // Clear all reservations from Firestore (Admin only)

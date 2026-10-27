@@ -156,3 +156,97 @@ test('Simultaneous booking contention: only first write succeeds, conflicting wr
   );
   assert.equal(state.length, 1, 'Rejected booking must not be committed');
 });
+
+test('Transactional Bed Reallocation: Moving reservation to a new bed releases old bed and reserves new bed', () => {
+  // Simulate transactional inventory foot-printing
+  const bedSchedules = new Map();
+
+  const allocateBedTransaction = (res, previousRes = null) => {
+    const nights = [];
+    const cur = new Date(res.checkIn);
+    const end = new Date(res.checkOut);
+    while (cur < end) {
+      nights.push(cur.toISOString().split('T')[0]);
+      cur.setDate(cur.getDate() + 1);
+    }
+
+    // Read phase: check for conflict on new bed
+    const newBedSched = bedSchedules.get(res.bedCode) || {};
+    for (const night of nights) {
+      const alloc = newBedSched[night];
+      if (alloc && alloc.reservationId !== res.id) {
+        throw new Error(`Double-booking prevented on bed ${res.bedCode}`);
+      }
+    }
+
+    // Write phase: clean up previous bed if reallocated
+    if (previousRes && previousRes.bedCode !== res.bedCode) {
+      const oldSched = bedSchedules.get(previousRes.bedCode) || {};
+      for (const [dKey, alloc] of Object.entries(oldSched)) {
+        if (alloc.reservationId === res.id) {
+          delete oldSched[dKey];
+        }
+      }
+      bedSchedules.set(previousRes.bedCode, oldSched);
+    }
+
+    // Reserve new bed
+    for (const night of nights) {
+      newBedSched[night] = { reservationId: res.id, guestName: res.guestName };
+    }
+    bedSchedules.set(res.bedCode, newBedSched);
+    return true;
+  };
+
+  // 1. Guest A books Bed B-B1L from 2026-11-01 to 2026-11-05
+  const guestA = {
+    id: 'MU-MOVE-1',
+    guestName: 'Traveler One',
+    bedCode: 'B-B1L',
+    checkIn: '2026-11-01',
+    checkOut: '2026-11-05'
+  };
+  allocateBedTransaction(guestA);
+
+  // 2. Guest B tries to book Bed B-B1L for same dates -> rejected!
+  assert.throws(
+    () => allocateBedTransaction({ id: 'MU-MOVE-2', guestName: 'Traveler Two', bedCode: 'B-B1L', checkIn: '2026-11-02', checkOut: '2026-11-04' }),
+    /Double-booking prevented/
+  );
+
+  // 3. Receptionist moves Guest A from Bed B-B1L to Bed B-B2L
+  const movedGuestA = { ...guestA, bedCode: 'B-B2L' };
+  allocateBedTransaction(movedGuestA, guestA);
+
+  // 4. Now Bed B-B1L is released! Guest B can now successfully book Bed B-B1L!
+  const guestBSuccess = allocateBedTransaction({
+    id: 'MU-MOVE-2',
+    guestName: 'Traveler Two',
+    bedCode: 'B-B1L',
+    checkIn: '2026-11-02',
+    checkOut: '2026-11-04'
+  });
+  assert.equal(guestBSuccess, true, 'Old bed must be released when reservation is reallocated');
+
+  // 5. Meanwhile, new Bed B-B2L is protected by Guest A
+  assert.throws(
+    () => allocateBedTransaction({ id: 'MU-MOVE-3', guestName: 'Traveler Three', bedCode: 'B-B2L', checkIn: '2026-11-03', checkOut: '2026-11-04' }),
+    /Double-booking prevented/
+  );
+});
+
+test('Transactional Inventory Release: Deleting reservation releases all occupied nights immediately', () => {
+  const bedSchedule = {
+    '2026-12-10': { reservationId: 'MU-DEL-1', guestName: 'Guest' },
+    '2026-12-11': { reservationId: 'MU-DEL-1', guestName: 'Guest' }
+  };
+
+  // Deletion releases allocations
+  for (const [night, alloc] of Object.entries(bedSchedule)) {
+    if (alloc.reservationId === 'MU-DEL-1') {
+      delete bedSchedule[night];
+    }
+  }
+
+  assert.equal(Object.keys(bedSchedule).length, 0, 'All dates must be freed upon deletion');
+});

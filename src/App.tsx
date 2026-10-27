@@ -1566,22 +1566,16 @@ export default function App() {
 
     // Attempt authoritative Firestore write with double-booking prevention BEFORE closing form modal
     try {
-      await saveReservationToFirestore(finalRecord);
-
-      // Record initial payment ledger entry ONLY for brand new bookings that have a paid deposit:
       if (isNew && finalRecord.paidAmount > 0) {
-        await recordPaymentTransaction({
-          id: `PAY-${finalRecord.id}-deposit`,
-          reservationId: finalRecord.id,
-          guestId: finalRecord.guestId,
+        await saveReservationToFirestore(finalRecord, {
           amount: finalRecord.paidAmount,
           currency: finalRecord.currency || 'USD',
-          type: finalRecord.balanceDue === 0 ? 'full' : 'deposit',
           method: 'BookingPlatform',
-          recordedBy: user?.email || 'admin',
           notes: `Initial deposit with new booking ${finalRecord.id}`,
-          createdAt: new Date().toISOString()
-        }).catch(e => console.warn('Payment transaction record note:', e));
+          idempotencyKey: `PAY-${finalRecord.id}-deposit`
+        });
+      } else {
+        await saveReservationToFirestore(finalRecord);
       }
 
       // Optional background sync to connected Google Sheet

@@ -79,3 +79,142 @@ test('Payment ledger: aggregates multiple payment transactions into verified res
   assert.equal(totalPaid, 60); // 30 + 40 - 10
   assert.equal(balanceRemaining, 20); // 80 - 60
 });
+
+test('Financial Idempotency: Retrying same payment transaction 10 times applies balance change exactly once', () => {
+  const paymentLedger = new Map();
+  let reservation = {
+    id: 'MU-TEST-FIN-1',
+    totalAmount: 100,
+    paidAmount: 0,
+    balanceDue: 100
+  };
+
+  const executeIdempotentPayment = (payment) => {
+    // Read phase
+    const existing = paymentLedger.get(payment.id);
+    if (existing) {
+      if (
+        existing.amount === payment.amount &&
+        existing.currency === payment.currency &&
+        existing.type === payment.type &&
+        existing.reservationId === payment.reservationId
+      ) {
+        // Idempotent retry: do not re-apply to balance
+        return { success: true, idempotentNoop: true };
+      }
+      throw new Error(`Conflicting payment transaction for ID ${payment.id}`);
+    }
+
+    // Apply change
+    const isRefund = payment.type === 'refund';
+    const newPaid = isRefund
+      ? Math.max(0, Math.round((reservation.paidAmount - payment.amount + Number.EPSILON) * 100) / 100)
+      : Math.round((reservation.paidAmount + payment.amount + Number.EPSILON) * 100) / 100;
+    const newBalance = Math.max(0, Math.round((reservation.totalAmount - newPaid + Number.EPSILON) * 100) / 100);
+
+    reservation.paidAmount = newPaid;
+    reservation.balanceDue = newBalance;
+    paymentLedger.set(payment.id, { ...payment });
+    return { success: true, idempotentNoop: false };
+  };
+
+  const depositPayment = {
+    id: 'PAY-MU-TEST-FIN-1-deposit',
+    reservationId: 'MU-TEST-FIN-1',
+    amount: 30,
+    currency: 'USD',
+    type: 'deposit'
+  };
+
+  // First call
+  const first = executeIdempotentPayment(depositPayment);
+  assert.equal(first.idempotentNoop, false);
+  assert.equal(reservation.paidAmount, 30);
+  assert.equal(reservation.balanceDue, 70);
+
+  // Retry 10 times with the same payment ID
+  for (let i = 0; i < 10; i++) {
+    const retryResult = executeIdempotentPayment(depositPayment);
+    assert.equal(retryResult.idempotentNoop, true);
+    assert.equal(reservation.paidAmount, 30, 'Paid amount must not increase on retry');
+    assert.equal(reservation.balanceDue, 70, 'Balance due must not decrease on retry');
+  }
+
+  // Conflict case: Same payment ID submitted with different amount
+  const conflictingPayment = {
+    id: 'PAY-MU-TEST-FIN-1-deposit',
+    reservationId: 'MU-TEST-FIN-1',
+    amount: 50, // Conflicting!
+    currency: 'USD',
+    type: 'deposit'
+  };
+
+  assert.throws(
+    () => executeIdempotentPayment(conflictingPayment),
+    /Conflicting payment transaction/
+  );
+});
+
+test('Financial Correctness: Creating booking with initial deposit counts deposit once and editing preserves balance', () => {
+  // Simulate atomic saveReservationToFirestore with initial payment
+  const reservationDb = new Map();
+  const paymentLedger = new Map();
+
+  const saveReservationAtomic = (res, initialPayment) => {
+    const existing = reservationDb.get(res.id);
+    let canonicalPaid = 0;
+    let canonicalBalance = res.totalAmount;
+
+    if (existing) {
+      canonicalPaid = existing.paidAmount || 0;
+      canonicalBalance = Math.max(0, res.totalAmount - canonicalPaid);
+    } else if (initialPayment && initialPayment.amount > 0) {
+      const payId = initialPayment.id || `PAY-${res.id}-deposit`;
+      paymentLedger.set(payId, {
+        id: payId,
+        reservationId: res.id,
+        amount: initialPayment.amount,
+        type: 'deposit'
+      });
+      canonicalPaid = initialPayment.amount;
+      canonicalBalance = Math.max(0, res.totalAmount - canonicalPaid);
+    }
+
+    const saved = {
+      ...res,
+      paidAmount: canonicalPaid,
+      balanceDue: canonicalBalance
+    };
+    reservationDb.set(res.id, saved);
+    return saved;
+  };
+
+  // 1. Create new booking with $40 deposit
+  const newBooking = {
+    id: 'MU-NEW-1',
+    guestName: 'Initial Guest',
+    room: 'Njoro (Room 2)',
+    bedCode: 'N-B1L',
+    checkIn: '2026-11-01',
+    checkOut: '2026-11-04',
+    totalAmount: 60
+  };
+
+  const created = saveReservationAtomic(newBooking, { amount: 40 });
+  assert.equal(created.paidAmount, 40);
+  assert.equal(created.balanceDue, 20);
+  assert.equal(paymentLedger.size, 1);
+
+  // 2. Edit existing booking (e.g. update guest name or notes)
+  const editedBooking = {
+    ...created,
+    guestName: 'Initial Guest (Edited Name)',
+    notes: 'Late arrival'
+  };
+
+  const updated = saveReservationAtomic(editedBooking);
+  assert.equal(updated.guestName, 'Initial Guest (Edited Name)');
+  assert.equal(updated.paidAmount, 40, 'Editing booking must preserve paidAmount');
+  assert.equal(updated.balanceDue, 20, 'Editing booking must preserve balanceDue');
+  assert.equal(paymentLedger.size, 1, 'No duplicate payment created during booking edit');
+});

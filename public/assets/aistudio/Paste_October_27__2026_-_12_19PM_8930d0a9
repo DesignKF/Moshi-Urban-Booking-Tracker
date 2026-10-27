@@ -1,0 +1,1033 @@
+# MOSHI URBAN PMS — FINAL CORRECTIVE ENGINEERING AND PRODUCTION READINESS DIRECTIVE
+
+## 1. YOUR ASSIGNMENT
+
+You are the senior engineering team responsible for completing the existing Moshi Urban Property Management System (PMS).
+
+You are acting as:
+
+- Principal full-stack engineer
+- Firebase and Firestore architect
+- Application security engineer
+- Database migration engineer
+- Financial systems engineer
+- Quality assurance engineer
+- PWA performance engineer
+- Release and deployment engineer
+
+I created this PWA using Google AI Studio. I am not a developer.
+
+**Your job is to make and verify the actual changes, not simply explain what should be done.**
+
+Work on the current application and its existing GitHub repository. Do not create a completely new PMS, discard existing features, or unnecessarily redesign the interface.
+
+Implement every applicable requirement in this directive, in the specified order.
+
+When a task cannot be completed because of unavailable permissions, unavailable private data, or a production safety boundary, document the blocker accurately and continue the other safe tasks.
+
+Do not falsely mark blocked or untested work as complete.
+
+Do not deploy production changes until explicit cutover approval is granted.
+
+---
+
+# 2. VERIFIED PROJECT INFORMATION
+
+Repository:
+
+https://github.com/DesignKF/Moshi-Urban-Booking-Tracker
+
+Latest checked `main` commit:
+
+`19309e5be5d2da57a38f2bbbfe349fab9bc6f5dc`
+
+Existing Firebase project configuration:
+
+`gen-lang-client-0837479015`
+
+Named Firestore database configuration:
+
+`ai-studio-moshiurbanhostel-566fa31d-f9a6-45cd-a21f-d1b89541acb3`
+
+You must verify the deployed runtime configuration independently. Do not assume the repository configuration and production are identical.
+
+Original booking workbook:
+
+`Moshi-Urban-Hostel-Bookings-3.0`
+
+Workbook:
+
+https://docs.google.com/spreadsheets/d/1BEKeeGb4-MVKG5FSDDI8b7xFoPQGlTwOquhM6xS-7zw/edit
+
+Confirmed booking source:
+
+- Tab: `Bookings`
+- Header row: 6
+- Data begins: row 7
+- Time zone: Africa/Dar_es_Salaam
+- Includes booking references, guests, rooms, beds, dates, statuses, currencies, gross amounts, deposits, other receipts, refunds, balances, commissions, and other operational fields.
+
+The whole Firestore database has also been exported to Google Cloud Storage.
+
+Existing development pull requests:
+
+- PR #2 — https://github.com/DesignKF/Moshi-Urban-Booking-Tracker/pull/2
+- PR #3 — https://github.com/DesignKF/Moshi-Urban-Booking-Tracker/pull/3
+
+Review these before implementing new or overlapping solutions.
+
+---
+
+# 3. IMMEDIATE EXECUTION RULES
+
+Before making changes:
+
+1. Inspect the latest GitHub `main` branch.
+2. Verify the current commit SHA.
+3. Inspect outstanding branches and pull requests.
+4. Check the Firebase database configuration.
+5. Determine whether the live PMS uses the same repository code.
+6. Identify all existing tests and deployment workflows.
+7. Create a new implementation branch from the current `main`.
+8. Record the initial test and build results.
+
+Do not directly overwrite production code while implementing unverified changes.
+
+Work in small, reviewable commits.
+
+Preserve the existing application's layout and user experience.
+
+After each implementation phase, run the required checks and repair failures before continuing.
+
+---
+
+# 4. CRITICAL ISSUE 1 — CORRECT BOOKING TRANSACTIONS
+
+Inspect:
+
+`src/firebase.ts`
+
+Relevant functions include:
+
+- `saveReservationToFirestore()`
+- `allocateNextBookingId()`
+
+Also inspect:
+
+- `src/bookingConflicts.ts`
+- `src/types.ts`
+- `firestore.rules`
+
+The latest implementation introduces `runTransaction()`, but the reservation-allocation design is incomplete.
+
+## Required behavior
+
+Implement authoritative occupancy protection for every physical bed and every occupied night.
+
+A booking must reserve the appropriate underlying inventory atomically.
+
+A booking modification must atomically release inventory no longer required and reserve newly required inventory.
+
+Cancellation must release only the inventory belonging to the cancelled reservation.
+
+Whole-room bookings must reserve all applicable physical beds rather than relying on a separate room-level marker that can conflict with individual-bed reservations.
+
+## Required transaction algorithm
+
+1. Validate the reservation request.
+2. Determine whether this is a creation, modification, cancellation, or reactivation.
+3. Read the existing reservation document within the transaction.
+4. Compute the full previous inventory footprint.
+5. Compute the full proposed inventory footprint.
+6. Determine the union of all affected inventory documents.
+7. Read every required document before issuing any transaction write.
+8. Check new allocations against allocations owned by other reservations.
+9. Reject conflicting requests.
+10. Remove outdated allocations owned by the current reservation.
+11. Write all new allocations for the current reservation.
+12. Update the reservation document atomically.
+13. Write the authoritative audit record using a safe operation ID.
+14. Commit all changes together.
+
+Never perform a database read after beginning the transaction write phase.
+
+Never rely only on frontend reservation state when checking availability.
+
+## Special cases to support
+
+- One bed overlapping another booking
+- Two staff booking the same bed simultaneously
+- Two staff booking different beds simultaneously
+- Whole-room versus single-bed reservations
+- Single-bed versus whole-room reservations
+- Multiple-bed reservations
+- Moving a reservation to another bed
+- Moving a reservation to another room
+- Extending a reservation
+- Shortening a reservation
+- Changing check-in or checkout
+- Cancelling a reservation
+- Reactivating a cancelled reservation
+- Deleting a reservation
+- Reassigning a booking after checkout
+- Reservations that span months or years
+- Same-day checkout and another guest's check-in
+
+Treat check-in as inclusive and checkout as exclusive.
+
+Use strict date validation.
+
+Do not assume that a transaction is safe merely because `runTransaction()` appears in the code.
+
+## Existing data compatibility
+
+The current production database may contain reservations without corresponding `bed_schedules` documents.
+
+Therefore, an empty bed schedule must not be treated as proof that the bed is available until the schedule has been reconciled against existing bookings.
+
+Build a safe inventory initialization and verification process.
+
+In staging, rebuild occupancy from canonical reservation records and compare it with generated inventory allocations.
+
+Identify conflicting historical assignments rather than silently choosing a winner.
+
+## Acceptance tests
+
+Test actual Firestore transactions with the Firebase Emulator Suite.
+
+Two concurrent attempts to reserve the same bed must result in exactly one accepted booking.
+
+Moving a reservation must release its old bed and reserve its new bed.
+
+A whole-room booking must block individual beds.
+
+Cancellation must release the correct dates without changing another reservation.
+
+Transaction failure must leave the previous reservation and inventory intact.
+
+Do not mark this task complete until these integration tests pass.
+
+---
+
+# 5. CRITICAL ISSUE 2 — MAKE FINANCIAL OPERATIONS IDEMPOTENT
+
+Inspect:
+
+`src/firebase.ts`
+
+Specifically:
+
+`recordPaymentTransaction()`
+
+Inspect all places in `src/App.tsx` that create or update payments.
+
+The existing implementation can update the reservation's paid amount again when an existing payment ID is submitted.
+
+This violates financial idempotency.
+
+## Required solution
+
+Use immutable, uniquely identified financial transactions.
+
+Each payment command must have a stable idempotency key generated once for the actual business operation and reused on retries.
+
+Within the same Firestore transaction:
+
+1. Read the reservation.
+2. Read the payment document identified by the idempotency key.
+3. If an identical payment already exists, return the original successful result without adjusting balances again.
+4. If that ID exists with conflicting transaction details, reject the request.
+5. Validate the amount and currency.
+6. Create the payment record exactly once.
+7. Apply the financial change exactly once.
+8. Write the audit record.
+9. Commit atomically.
+
+Never perform an upsert of a financial transaction that can modify an existing payment without explicit, privileged correction logic.
+
+Do not use `Date.now()` as the only uniqueness or idempotency mechanism.
+
+Store transaction identifiers, actor identifiers, timestamps, transaction type, and source references.
+
+## Initial deposit duplication
+
+The latest `src/App.tsx` saves a new reservation with `paidAmount > 0` and subsequently calls `recordPaymentTransaction()` for the initial deposit.
+
+This can double-count the payment.
+
+Fix this immediately.
+
+Choose and consistently implement one of these architectures:
+
+**Preferred architecture:** Create the reservation with a zero opening paid balance and record its initial payment once through the dedicated financial transaction mechanism.
+
+For migrated historical balances, implement an explicitly identified opening balance or migration transaction that is never re-created by normal reservation edits.
+
+Prevent an initial payment failure from being disguised as a successful fully-paid booking.
+
+If booking and initial deposit must be one business transaction, design one atomic server-controlled operation that handles both.
+
+## Financial correctness
+
+Implement:
+- Separate payment and refund records
+- Correct partial payment handling
+- Overpayment handling
+- Adjustments with audit history
+- Stable currency handling
+- Currency-specific precision
+- Traceable exchange rates when converting currencies
+- Proper commission treatment
+- Consistent outstanding balances
+- Historical payment migration without invented payment events
+
+Do not automatically assume the sheet's `Net received` column equals its total guest payments.
+
+Reconcile deposits, other receipts, refunds, gross values, platform commissions and balances according to the actual workbook's formulas and business meaning.
+
+## Required tests
+
+- Retry the same payment ID 10 times: balance changes once.
+- Submit conflicting amounts with the same payment ID: reject.
+- Create a booking with an initial deposit: deposit counted once.
+- Edit a paid booking: no additional payment generated.
+- Record multiple distinct payments: balances update correctly.
+- Refund a payment: balance changes correctly.
+- Retry a refund: no duplicate refund.
+- Simultaneous payment updates: no lost updates.
+- Test TZS and USD separately.
+- Test overpayments without silently discarding them.
+- Test failed transactions and network retries.
+
+Verify actual persisted Firestore results in the emulator.
+
+---
+
+# 6. CRITICAL ISSUE 3 — CLOSE DATABASE RULES BYPASS PATHS
+
+Inspect:
+
+`firestore.rules`
+
+The latest rules have improved staff approval checks.
+
+However, they still allow approved staff to directly create or modify occupancy schedule documents and booking counters.
+
+This can undermine booking ID uniqueness and conflict prevention.
+
+## Required changes
+
+Ordinary client applications must not have unrestricted write access to:
+
+- `bed_schedules`
+- `counters`
+- Canonical financial balances
+- Privileged staff roles
+- Migration checkpoints
+- Financial audit history
+
+Move sensitive mutations into trusted server-controlled operations where appropriate, using Cloud Functions, Cloud Run, or another suitable trusted backend.
+
+A transaction is not authoritative if users can bypass its invariants by making other permitted client writes.
+
+Determine the minimum client permissions necessary for each workflow.
+
+For sensitive collections, deny direct client writes and allow writes only through an authenticated, authorized trusted operation.
+
+Remember that Firebase Admin SDK operations bypass Firestore Security Rules. The trusted service must therefore enforce authorization itself.
+
+## Staff identity and approval
+
+Do not grant PMS access merely because someone has a Google account.
+
+Require an approved, active staff record or trusted equivalent.
+
+The current bootstrap email mechanism must be replaced with controlled initial administrator provisioning.
+
+Use a secure one-time administrator setup or an existing verified administrator to grant access.
+
+Do not rely permanently on hardcoded privileged email exceptions.
+
+Existing authorized staff accounts must be migrated safely without locking everyone out.
+
+## Protect against privilege escalation
+
+Employees must never change their own permissions by modifying:
+
+- `users/{uid}`
+- `user_roles/{email}`
+- Custom claims
+- Any indirectly trusted field
+
+Only trusted administrative actions may change privileges.
+
+Suspensions must be enforced by the server authorization model.
+
+## Protect financial data
+
+Prevent normal reservation updates from arbitrarily modifying:
+
+- `paidAmount`
+- `balanceDue`
+- Financial adjustment fields
+- Recorded payment amounts
+- Refund history
+
+Payment totals must be maintained through authorized financial operations.
+
+## Audit logs
+
+Do not permit arbitrary staff-authored audit entries to masquerade as authoritative system history.
+
+Use trusted writes for authoritative logs.
+
+Make logs append-only for normal operators.
+
+Provide narrowly controlled correction procedures rather than allowing silent alteration of historical activity.
+
+## Security testing
+
+Use `@firebase/rules-unit-testing` or an equivalent Firebase Emulator Suite integration.
+
+Test:
+
+- Signed-out users
+- Unknown signed-in users
+- Pending staff
+- Approved receptionists
+- Property managers
+- Administrators
+- Suspended users
+- Users attempting to promote themselves
+- Staff trying to write bed schedules directly
+- Staff trying to change booking counters
+- Staff trying to alter financial totals directly
+- Unauthorized payment changes
+- Unauthorized guest access
+- Attempts to alter audit records
+
+Do not substitute mocked JavaScript role calculations for actual rules integration tests.
+
+Tests must execute against the rules that will be deployed.
+
+---
+
+# 7. CRITICAL ISSUE 4 — CORRECT BOOKING ID GENERATION
+
+Inspect:
+
+`allocateNextBookingId()` in `src/firebase.ts`
+
+The current approach initializes a counter using a supplied list of reservations and uses a timestamp/random fallback on failure.
+
+This cannot be treated as a proven uniqueness guarantee.
+
+## Required solution
+
+Use an authoritative server-controlled allocation mechanism.
+
+Seed the sequence only after checking all existing booking references in the authoritative dataset.
+
+Never derive the initial counter solely from an incomplete browser list.
+
+Ensure that concurrent allocations cannot return the same booking reference.
+
+When allocating an ID, distinguish a reserved ID from a successfully created booking.
+
+Ensure the system handles failed bookings and skipped numbers safely.
+
+Use stable Firestore document IDs.
+
+Keep human-readable booking references as separate fields if needed.
+
+Never silently overwrite an existing reservation when booking IDs collide.
+
+If the sequence allocator is unavailable, display a clear error or use a rigorously defined collision-resistant document ID with uniqueness enforcement.
+
+Do not promise that a timestamp plus a small random number is guaranteed unique.
+
+## Tests
+
+Run many simultaneous allocations in the emulator.
+
+Verify there are no duplicate IDs.
+
+Verify correct behavior when imported bookings already use high sequence numbers.
+
+Verify that retries do not create duplicate reservations.
+
+Verify that a failed operation never overwrites an existing booking.
+
+---
+
+# 8. CRITICAL ISSUE 5 — COMPLETE FIRESTORE-ONLY OPERATION
+
+Inspect:
+
+`src/App.tsx`
+
+`src/sheetsService.ts`
+
+`src/sheetSafety.mjs`
+
+The latest code still contains operational calls to:
+
+- `syncFromGoogleSheet()`
+- `saveReservationToSheet()`
+
+It also still persists reservation data in browser localStorage.
+
+This is not yet a Firestore-only PMS.
+
+## Required architecture
+
+Firestore must become the sole authority for:
+
+- Reservations
+- Guests
+- Bed and room availability
+- Payments and refunds
+- Check-in and checkout
+- Booking statuses
+- Administrative settings
+- Staff access
+
+Implement real-time Firestore subscriptions where appropriate.
+
+Ensure every screen uses the same canonical state.
+
+Do not allow a background spreadsheet sync to overwrite a newer Firestore reservation.
+
+Do not treat localStorage as a booking database.
+
+Remove browser persistence of sensitive guest records where it is not specifically required, justified, access-controlled and protected.
+
+Retain only harmless preferences such as interface settings when appropriate.
+
+## Feature flag and safe transition
+
+Create a controlled migration mode that allows the new Firestore-only workflows to be tested in staging.
+
+Keep the current production workflow unchanged until final reconciliation and cutover.
+
+Do not remove or disable Google Sheets synchronization in the live application until production migration has been explicitly approved.
+
+After successful cutover, remove operational spreadsheet code and related OAuth scopes.
+
+Remove obsolete spreadsheet synchronization buttons and settings.
+
+Keep read-only historical export capability only if it serves a documented purpose.
+
+## Failure handling
+
+Never swallow important write failures with an empty `.catch()`.
+
+Do not show success after:
+- A failed booking transaction
+- An unrecorded required initial payment
+- A failed cancellation
+- A failed check-in or checkout
+- A failed financial adjustment
+
+Show meaningful messages and provide safe retry behavior.
+
+Do not retry financial operations with a fresh ID.
+
+---
+
+# 9. MIGRATION AND REAL DATA RECONCILIATION
+
+Inspect:
+
+`src/migration/reconciliation.ts`
+
+Review the migration tools from GitHub PR #2.
+
+The source is the confirmed `Bookings` tab in the Google Sheets workbook.
+
+The existing Firestore backup is stored in Google Cloud Storage and contains the entire Firestore database.
+
+## Data safety
+
+Do not import the whole Cloud Storage backup into the live database.
+
+Use an isolated, verified project or another approved read-only extraction mechanism.
+
+Never upload real guest records to the public GitHub repository.
+
+Keep all credentials and private files outside version control.
+
+Verify the source and destination project IDs before every cloud operation.
+
+## Mandatory comparison
+
+Compare:
+- Booking IDs
+- Guest identity references
+- Guest names
+- Check-in dates
+- Checkout dates
+- Room assignments
+- Bed assignments
+- Reservation status
+- Currency
+- Gross booking value
+- Deposits
+- Additional payments
+- Refunds
+- Outstanding balance
+- Historical and cancelled reservations
+- Inventory-blocking state
+
+Normalize date representations without shifting calendar dates because of time zones.
+
+Compare financial amounts with explicit currency handling.
+
+Do not silently ignore differences where only one source has a value.
+
+Treat duplicates and conflicts as reviewable exceptions.
+
+## Migration must be
+
+- Repeatable
+- Restartable
+- Idempotent
+- Auditable
+- Non-destructive
+- Protected by verified backups
+- Reconciled before production use
+
+Build a dry-run mode that performs no writes.
+
+Produce a reconciliation report with:
+
+- Total Google Sheets records
+- Total Firestore records
+- Unique booking IDs
+- Missing IDs
+- Duplicate IDs
+- Field differences
+- Financial discrepancies
+- Invalid dates
+- Conflicting assignments
+- Unresolved issues
+- Exact source snapshot timestamps
+
+Produce an explicit go/no-go decision based on these findings.
+
+If source records disagree, never guess which record is correct.
+
+---
+
+# 10. PRESERVE ALL EXISTING PMS FUNCTIONS
+
+Do not replace the application with a basic reservation form.
+
+Preserve and improve:
+
+- Dashboard and statistics
+- Booking calendar
+- Reservations management
+- Guest profiles
+- Room and bed assignments
+- Check-in and checkout
+- Cancellations
+- Payment recording
+- Refund recording
+- Booking history
+- Staff administration
+- Availability checking
+- Financial reports
+- Currency handling
+- Search and filtering
+- Mobile navigation
+- PWA installation and offline behavior
+- Existing room and bed configuration
+
+The existing interface should remain familiar.
+
+Fix broken workflows rather than deleting them.
+
+Review room names and bed codes before implementing occupancy mapping.
+
+---
+
+# 11. REFACTOR THE APPLICATION SAFELY
+
+`src/App.tsx` remains extremely large.
+
+Refactor it incrementally into focused modules.
+
+Suggested structure:
+
+- Authentication and permissions
+- Reservation domain logic
+- Availability and inventory
+- Payment ledger
+- Guest management
+- Reporting
+- Staff administration
+- Firestore data services
+- Migration utilities
+- UI components and screens
+
+Keep existing functionality working after each refactoring step.
+
+Avoid introducing multiple competing sources of truth.
+
+Avoid changing large files without regression tests.
+
+Use strict TypeScript where practical.
+
+Do not hide type errors with excessive `any` usage or disabling compiler checks.
+
+---
+
+# 12. IMPROVE USER EXPERIENCE
+
+Keep the design recognizable while improving daily hostel operations.
+
+Requirements:
+
+- Clear booking save confirmation
+- Clear payment confirmation
+- Loading indicators
+- Friendly error messages
+- Safe retry buttons
+- Visible current reservation status
+- Consistent room availability
+- Easy guest search
+- Mobile-friendly booking forms
+- Fast navigation
+- Clear staff permissions
+- Accurate dashboard summaries
+- No unexpected data disappearance
+- No duplicated financial transactions
+
+In the case of an internet outage, the application must not falsely claim that a booking or payment was successfully saved.
+
+If offline booking creation is disabled for safety, display a clear connection-required message.
+
+Handle PWA caching so obsolete application code does not continue operating against incompatible data structures.
+
+---
+
+# 13. BUILD REAL INTEGRATION TESTS
+
+The existing tests include useful logic tests, but they do not yet prove all database invariants.
+
+Create an appropriate automated test hierarchy.
+
+## Unit tests
+
+Test:
+- Dates
+- Currency arithmetic
+- Booking validation
+- Room and bed normalization
+- Financial calculations
+- Reconciliation mapping
+
+## Firebase emulator integration tests
+
+Test:
+- Firestore transactions
+- Booking collisions
+- Reservation modifications
+- Payment idempotency
+- Authorization
+- User suspension
+- Inventory release
+- Rollbacks
+- Transaction retries
+
+## End-to-end tests
+
+Test real UI workflows in an isolated staging environment.
+
+Test:
+- Login
+- Staff approval
+- New reservation
+- Booking modification
+- Cancellation
+- Check-in
+- Checkout
+- Deposit payment
+- Partial payment
+- Refund
+- Payment retry
+- Room reassignment
+- Simultaneous booking submissions
+- Logout
+- Reopening the PWA
+
+Do not claim the system passes a test unless that test actually ran.
+
+---
+
+# 14. TEST COMMANDS AND RELEASE GATES
+
+Run:
+
+`npm test`
+
+`npm run lint`
+
+`npm run build`
+
+Also run:
+- Firebase emulator rule tests
+- Transaction integration tests
+- End-to-end workflow tests
+- Reconciliation tests
+- Relevant security and dependency checks
+
+Use the repository's actual package manager and scripts.
+
+If required scripts do not exist, create them with the appropriate tools and dependencies.
+
+Document how to reproduce the test environment.
+
+All critical tests must pass before a production release is proposed.
+
+A passing build alone is not a release approval.
+
+---
+
+# 15. STAGING ENVIRONMENT
+
+Create or use a separate staging environment.
+
+The staging system must not write to production collections.
+
+Use fictional test records for development.
+
+If an authorized staging copy of real guest data is necessary for reconciliation, restrict access, minimize exposure, and apply a documented deletion and retention policy.
+
+Test the full application against staging.
+
+Verify:
+- Authentication
+- Approved staff access
+- Data reads
+- Reservation creation
+- Inventory locking
+- Payment recording
+- Guest management
+- Audit logging
+- Reports
+- Security rules
+- Database indexes
+- PWA behavior
+
+Document staging verification results.
+
+---
+
+# 16. PRODUCTION MIGRATION RULES
+
+Do not automatically switch production to the new database architecture.
+
+Before production cutover:
+
+1. Verify backups.
+2. Verify a restoration procedure.
+3. Reconcile every booking.
+4. Investigate unresolved conflicts.
+5. Verify financial totals.
+6. Verify occupied beds and upcoming arrivals.
+7. Verify staff accounts and permissions.
+8. Verify the final Firestore schema.
+9. Verify transaction safety.
+10. Run the complete staging test suite.
+11. Prepare a rollback procedure.
+12. Prepare a final synchronization and booking-edit freeze plan.
+13. Obtain my explicit production approval.
+
+When approved, use a controlled, monitored cutover.
+
+Do not declare success until real operational tests pass after deployment.
+
+If serious problems occur, follow the documented rollback procedure and account for any bookings entered after cutover.
+
+---
+
+# 17. SECURITY AND PRIVACY REQUIREMENTS
+
+This project handles real guest information.
+
+Never:
+- Commit guest exports to public GitHub
+- Commit service-account private keys
+- Expose administrator credentials
+- Make reservation collections publicly readable
+- Permit users to promote themselves
+- Permit arbitrary payment modifications
+- Expose production backups publicly
+- Store unnecessary sensitive information in browser localStorage
+- Hide a failed transaction from the user
+
+Use least-privilege service accounts, secure secret handling, encrypted communication and controlled access.
+
+Audit all server-controlled functions for authorization bypasses.
+
+Validate inputs on the trusted server, even if the frontend also validates them.
+
+---
+
+# 18. REQUIRED IMPLEMENTATION SEQUENCE
+
+Follow this sequence exactly.
+
+**Phase 1 — Baseline and audit**
+
+Inspect the latest code and reproduce the existing test/build results.
+
+**Phase 2 — Financial correctness**
+
+Fix the initial-deposit double-counting defect, implement payment idempotency and add emulator integration tests.
+
+**Phase 3 — Booking integrity**
+
+Fix transactional inventory changes, old allocation release, whole-room handling and booking ID allocation. Add concurrency tests.
+
+**Phase 4 — Trusted authorization**
+
+Close direct-write bypasses in Firestore rules and implement trusted operations and staff authorization. Test actual security rules.
+
+**Phase 5 — Staging data integrity**
+
+Verify the temporary database, initialize and reconcile inventory, and test migrated reservations using an isolated environment.
+
+**Phase 6 — Firestore-only frontend**
+
+Refactor the PMS screens to use Firestore as the sole operational database. Remove spreadsheet-dependent runtime behavior in staging.
+
+**Phase 7 — Complete testing**
+
+Run unit, emulator integration, end-to-end, security and build checks. Fix all critical defects.
+
+**Phase 8 — Migration readiness**
+
+Reconcile real bookings privately, verify backups, check financial balances, and produce the production cutover plan.
+
+**Phase 9 — Production cutover**
+
+Proceed only after I explicitly authorize it, following the approved plan.
+
+**Phase 10 — Final verification**
+
+Confirm that the live PMS works correctly and Google Sheets is no longer required for operational workflows.
+
+---
+
+# 19. DEFINITION OF DONE
+
+Do not report the PMS as finished until all of the following are verified:
+
+- No original reservation has been lost.
+- Existing guest records have been preserved.
+- Firestore is the sole operational database.
+- Google Sheets is no longer part of live booking operations.
+- Approved staff can sign in reliably.
+- Unknown users cannot access private guest records.
+- Suspended staff cannot access the system.
+- Privilege escalation is prevented.
+- Direct writes cannot bypass inventory protection.
+- Concurrent bookings cannot occupy the same physical inventory.
+- Rescheduling correctly releases previous allocations.
+- Booking IDs cannot overwrite existing bookings.
+- Initial deposits are counted once.
+- Payment retries cannot duplicate payments.
+- Refund retries cannot duplicate refunds.
+- Financial reports reconcile with authoritative records.
+- Booking history remains available.
+- Check-in and checkout function correctly.
+- The PWA works on mobile and desktop.
+- Security emulator tests pass.
+- Transaction integration tests pass.
+- End-to-end tests pass.
+- All existing critical features are retained.
+- Production backups and recovery have been verified.
+- The final deployment has been checked.
+
+---
+
+# 20. DELIVERABLES
+
+Produce actual code changes and these supporting deliverables:
+
+1. Updated application source code.
+2. Updated Firestore Security Rules.
+3. Secure trusted booking and payment operations.
+4. Database indexes and deployment configuration.
+5. Automated unit tests.
+6. Emulator integration tests.
+7. End-to-end tests for critical workflows.
+8. Private migration and reconciliation utilities.
+9. A reconciliation report based on actual authorized source data.
+10. A staging verification report.
+11. A production deployment and rollback plan.
+12. An administrator guide.
+13. A release readiness report.
+
+Do not fill reports with unsupported claims.
+
+For each test, provide the command, result and relevant commit or artifact reference.
+
+---
+
+# 21. HOW YOU MUST REPORT TO ME
+
+At the end of each phase, provide a concise report with these headings:
+
+**Implemented:** Actual source changes completed.
+
+**Verified:** Tests run and their results.
+
+**Remaining:** Work still unfinished.
+
+**Blocked:** Missing access, data or approvals.
+
+**Production safety:** Whether any production data or configuration changed.
+
+**Next action:** The next engineering task you will actually perform.
+
+Do not repeatedly ask me to choose technical details that can be resolved safely through engineering judgment.
+
+If something is blocked, proceed with all other independent work.
+
+Do not request passwords or private keys in the conversation.
+
+When production approval is required, show me a short plain-English explanation of exactly what will change, what can go wrong, how bookings will be protected, and how the change can be reversed.
+
+---
+
+# 22. FINAL EXECUTION DIRECTIVE
+
+You are not being asked to create another architecture proposal.
+
+You are being asked to complete and verify the real Moshi Urban PMS application.
+
+Start from GitHub commit `19309e5be5d2da57a38f2bbbfe349fab9bc6f5dc` or its verified newer successor.
+
+Fix the payment double-counting and idempotency problems first.
+
+Then fix transactional inventory ownership, stale bed allocations, whole-room occupancy and booking ID generation.
+
+Then close the Firestore rules bypasses and secure staff access.
+
+Then complete the Firestore-only frontend.
+
+Then reconcile original bookings against the protected data sources and verify all major operational workflows in staging.
+
+Make the necessary code changes, run the tests, repair failures, commit the work and prepare the release.
+
+Only pause for permissions, unavailable protected data or explicit production approval.
+
+**Preserve every real guest booking. Do not guess away unresolved discrepancies. Do not deploy an unsafe migration. Do not describe incomplete or untested work as complete.**
+
+Your final objective is a secure, reliable, accurate, fully functioning Moshi Urban PMS that no longer depends on Google Sheets for daily operations.
+
+BEGIN THE ACTUAL IMPLEMENTATION NOW.
