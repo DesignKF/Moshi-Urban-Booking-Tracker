@@ -97,8 +97,7 @@ service cloud.firestore {
           && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.role == 'admin'
           && (!('status' in get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data)
               || get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.status != 'suspended'))
-        || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
-          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+
       );
     }
 
@@ -113,8 +112,7 @@ service cloud.firestore {
             && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.role == 'manager'
             && (!('status' in get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data)
                 || get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.status != 'suspended'))
-          || (exists(/databases/$(database)/documents/users/$(request.auth.uid))
-            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'manager')
+
         )
       );
     }
@@ -125,7 +123,7 @@ service cloud.firestore {
 
     // Reservations Collection - Publicly viewable hostel bookings & availability, editable only by authorized Admins and Property Managers
     match /reservations/{reservationId} {
-      allow get, list: if true;
+      allow get, list: if isPropertyManagerOrAdmin();
       allow create: if isPropertyManagerOrAdmin()
         && isValidId(reservationId)
         && isValidReservation(incoming());
@@ -137,7 +135,8 @@ service cloud.firestore {
 
     // User Roles Collection - Managed by administrators to grant or revoke app access
     match /user_roles/{email} {
-      allow get, list: if isSignedIn();
+      allow get: if isSignedIn() && (isAdmin() || request.auth.token.email == email);
+      allow list: if isAdmin();
       allow create, update: if isAdmin() && isValidUserRole(incoming());
       allow delete: if isAdmin();
     }
@@ -149,7 +148,13 @@ service cloud.firestore {
       allow create, update: if isSignedIn()
         && (request.auth.uid == userId || isAdmin())
         && isValidId(userId)
-        && isValidUserProfile(incoming());
+        && isValidUserProfile(incoming())
+        && incoming().uid == userId
+        && (isAdmin()
+          || ((!('role' in incoming()) || incoming().role == 'staff')
+            && (!exists(/databases/$(database)/documents/users/$(userId))
+              || !('role' in existing())
+              || incoming().role == existing().role)));
       allow delete: if isAdmin();
     }
   }
