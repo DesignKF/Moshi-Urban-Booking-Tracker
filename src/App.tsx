@@ -240,21 +240,14 @@ export default function App() {
   // Active Tab: Overview, Bookings, Availability, Rooms, Sheets, Changelog, and Admin Panel
   const [activeTab, setActiveTab] = useState<'overview' | 'bookings' | 'availability' | 'rooms' | 'sheets' | 'changelog' | 'admin'>('overview');
 
-  // Reservations Data (Starts completely clean & fresh)
+  // Reservations Data (Authoritative state populated from Firestore real-time listener)
   const [reservations, setReservations] = useState<Reservation[]>(() => {
-    const freshStartClean = localStorage.getItem('muh_fresh_start_clean_v1');
-    if (!freshStartClean) {
-      localStorage.setItem('muh_fresh_start_clean_v1', 'true');
-      localStorage.setItem('muh_reservations_db', '[]');
-      return [];
-    }
-    const saved = localStorage.getItem('muh_reservations_db');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        return [];
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        localStorage.removeItem('muh_reservations_db');
       }
+    } catch {
+      // ignore
     }
     return [];
   });
@@ -732,10 +725,14 @@ export default function App() {
     }
   }, [formData.checkIn, formData.checkOut, availableRooms, modalAvailability, isBookingModalOpen]);
 
-  // Save to LocalStorage whenever reservations change
+  // Ensure any lingering reservation cache in localStorage is purged
   useEffect(() => {
-    localStorage.setItem('muh_reservations_db', JSON.stringify(reservations));
-  }, [reservations]);
+    try {
+      localStorage.removeItem('muh_reservations_db');
+    } catch {
+      // ignore
+    }
+  }, []);
 
   // Save Change Logs to LocalStorage
   useEffect(() => {
@@ -1121,11 +1118,9 @@ export default function App() {
       setIsInitialLoading(false);
 
       if (parsed.length > 0) {
-        setReservations(parsed);
-        // Sync records to Firestore
-        for (const item of parsed) {
-          saveReservationToFirestore(item).catch(() => {});
-        }
+        // Transitional dual-bridge: preserve authoritative Firestore records if already loaded,
+        // otherwise initialize with parsed sheet records. Do not blindly overwrite Firestore in background!
+        setReservations(prev => (prev && prev.length > 0 ? prev : parsed));
 
         setSyncStatus('success');
         setSyncMessage(`Synchronized ${parsed.length} reservations with Google Sheet at ${now}`);
@@ -2279,7 +2274,7 @@ export default function App() {
           await clearConnectedBookings([], true);
           pushUndo(`Fresh start (${snapshotBefore.length} bookings)`, snapshotBefore);
           setReservations([]); setSelectedBookingIds([]);
-          localStorage.setItem('muh_reservations_db', '[]');
+          try { localStorage.removeItem('muh_reservations_db'); } catch { /* ignore */ }
           recordChange('delete', 'Fresh Start: All Bookings Cleared', 'Connected booking records cleared; worksheet structure preserved.',
             undefined, undefined, 'Fresh start: 0 bookings', snapshotBefore);
           triggerToast('All booking records cleared from connected stores.', 'success');

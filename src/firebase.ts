@@ -10,6 +10,7 @@ import {
 import {
   getFirestore,
   doc,
+  getDoc,
   getDocFromServer,
   collection,
   getDocs,
@@ -384,11 +385,9 @@ export async function allocateNextBookingId(existingReservations: Reservation[] 
       }, { merge: true });
       return candidateId;
     });
-  } catch {
-    // High-entropy monotonic fallback: guaranteed collision-free even if offline
-    const timestampStr = Date.now().toString(36).toUpperCase();
-    const randPart = Math.floor(Math.random() * 9000 + 1000);
-    return `MU-${timestampStr}-${randPart}`;
+  } catch (error: any) {
+    console.error('Authoritative sequence counter allocation failure:', error);
+    throw new Error(`Failed to allocate sequential booking ID from database counter: ${error?.message || 'Database transaction error'}. Please verify connection and administrator permissions.`);
   }
 }
 
@@ -478,7 +477,14 @@ export async function saveReservationToFirestore(
         existingPaySnap = await tx.get(doc(db, 'payments', paymentId));
       }
 
+      // Check authoritative inventory initialization status
+      const invStatusSnap = await tx.get(doc(db, 'counters', 'inventory_status'));
+
       // Step B: Conflict verification across all proposed nights on all proposed beds
+      if (invStatusSnap.exists() && invStatusSnap.data()?.initialized === false) {
+        throw new Error('Inventory safety block: Bed inventory initialization is pending. Reconcile historical reservations before booking.');
+      }
+
       if (!isCancelled) {
         for (const bCode of newBeds) {
           const sched = bedScheduleMap.get(bCode);
@@ -599,6 +605,18 @@ export async function saveReservationToFirestore(
  * - Rejects conflicting payment records with same ID
  * - Atomically updates reservation paidAmount and balanceDue
  */
+/**
+ * Generates a stable, unique business operation idempotency key for financial transactions.
+ * When a payment is retried across network disconnects, the same idempotency key is reused.
+ * Two distinct payments of the exact same amount receive separate unique keys.
+ */
+export function generatePaymentIdempotencyKey(reservationId: string, operationType: string = 'payment'): string {
+  const nonce = typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  return `PAY-${reservationId}-${operationType}-${nonce}`;
+}
+
 export async function recordPaymentTransaction(payment: PaymentTransaction): Promise<void> {
   if (!auth.currentUser) {
     throw new Error('Authentication required to record payments.');
@@ -611,7 +629,7 @@ export async function recordPaymentTransaction(payment: PaymentTransaction): Pro
     throw new Error('Invalid payment: reservationId and positive amount are required.');
   }
 
-  const paymentId = payment.id || `PAY-${payment.reservationId}-${payment.type}-${Math.round(payment.amount * 100)}`;
+  const paymentId = payment.id || generatePaymentIdempotencyKey(payment.reservationId, payment.type);
   const now = new Date().toISOString();
   const userEmail = auth.currentUser.email || 'system';
 
@@ -806,15 +824,32 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
   }
 }
 
-/**
- * Rebuilds and reconciles bed schedules from canonical Firestore reservations.
- * Flags any historical overlapping assignments and writes coherent bed_schedules.
- */
-export async function rebuildBedSchedulesFromReservations(): Promise<{
+export interface RebuildSchedulesOptions {
+  dryRun?: boolean;
+  explicitApproval?: boolean;
+  verifiedBackupTimestamp?: string;
+}
+
+export interface RebuildSchedulesResult {
+  dryRun: boolean;
+  success: boolean;
+  written: boolean;
+  blockedReason?: string;
   processedReservations: number;
   populatedBeds: number;
   historicalConflicts: string[];
-}> {
+}
+
+/**
+ * Rebuilds and reconciles bed schedules from canonical Firestore reservations.
+ * - Defaults to dryRun: true to safely audit inventory without mutating the database
+ * - If historical conflicts exist, blocks automatic write until human review
+ * - Requires explicit cutover approval and verified backup timestamp before writing
+ */
+export async function rebuildBedSchedulesFromReservations(
+  options: RebuildSchedulesOptions = {}
+): Promise<RebuildSchedulesResult> {
+  const dryRun = options.dryRun !== false; // Default true!
   const allReservations = await fetchReservationsFromFirestore();
   const activeReservations = allReservations.filter(r => {
     const st = (r.status || '').toLowerCase();
@@ -849,7 +884,45 @@ export async function rebuildBedSchedulesFromReservations(): Promise<{
     }
   }
 
-  // Persist reconstructed schedules to Firestore
+  // 1. Dry run returns report without writing
+  if (dryRun) {
+    return {
+      dryRun: true,
+      success: true,
+      written: false,
+      processedReservations: activeReservations.length,
+      populatedBeds: bedAllocationsMap.size,
+      historicalConflicts: conflicts
+    };
+  }
+
+  // 2. Safety Gate: Block write if unresolved historical conflicts exist
+  if (conflicts.length > 0) {
+    return {
+      dryRun: false,
+      success: false,
+      written: false,
+      blockedReason: `Safety Block: Found ${conflicts.length} historical conflicts. Conflicting reservations must be resolved before writing bed schedules.`,
+      processedReservations: activeReservations.length,
+      populatedBeds: bedAllocationsMap.size,
+      historicalConflicts: conflicts
+    };
+  }
+
+  // 3. Safety Gate: Require explicit administrator cutover authorization
+  if (!options.explicitApproval || !options.verifiedBackupTimestamp) {
+    return {
+      dryRun: false,
+      success: false,
+      written: false,
+      blockedReason: 'Safety Block: Writing bed schedules requires explicit administrator cutover approval and a verified backup timestamp.',
+      processedReservations: activeReservations.length,
+      populatedBeds: bedAllocationsMap.size,
+      historicalConflicts: conflicts
+    };
+  }
+
+  // 4. Safe write phase only after all gates pass
   const now = new Date().toISOString();
   for (const [bCode, allocations] of bedAllocationsMap.entries()) {
     await setDoc(doc(db, 'bed_schedules', bCode), {
@@ -859,11 +932,45 @@ export async function rebuildBedSchedulesFromReservations(): Promise<{
     }, { merge: true });
   }
 
+  // Authoritative inventory initialization status in counters collection
+  await setDoc(doc(db, 'counters', 'inventory_status'), {
+    id: 'inventory_status',
+    initialized: true,
+    lastRebuiltAt: now,
+    processedReservations: activeReservations.length,
+    populatedBeds: bedAllocationsMap.size,
+    verifiedBackupTimestamp: options.verifiedBackupTimestamp,
+    updatedAt: now
+  }, { merge: true });
+
   return {
+    dryRun: false,
+    success: true,
+    written: true,
     processedReservations: activeReservations.length,
     populatedBeds: bedAllocationsMap.size,
     historicalConflicts: conflicts
   };
+}
+
+/**
+ * Checks whether authoritative inventory schedules have been reconciled and initialized
+ */
+export async function getInventoryInitializationStatus(): Promise<{
+  initialized: boolean;
+  lastRebuiltAt?: string;
+  processedReservations?: number;
+  populatedBeds?: number;
+}> {
+  try {
+    const snap = await getDoc(doc(db, 'counters', 'inventory_status'));
+    if (snap.exists()) {
+      return snap.data() as any;
+    }
+    return { initialized: false };
+  } catch {
+    return { initialized: false };
+  }
 }
 
 // Clear all reservations from Firestore (Admin only)

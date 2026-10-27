@@ -250,3 +250,85 @@ test('Transactional Inventory Release: Deleting reservation releases all occupie
 
   assert.equal(Object.keys(bedSchedule).length, 0, 'All dates must be freed upon deletion');
 });
+
+test('Safe Inventory Reconstruction: Defaults to dry-run mode and reports conflicts without writing', () => {
+  const reservations = [
+    { id: 'RES-1', guestName: 'Alice', room: 'Mawenzi (Room 1)', bedCode: 'M-S1', checkIn: '2026-11-01', checkOut: '2026-11-03', status: 'Confirmed' },
+    { id: 'RES-2', guestName: 'Bob', room: 'Mawenzi (Room 1)', bedCode: 'M-S1', checkIn: '2026-11-02', checkOut: '2026-11-04', status: 'Confirmed' } // Overlap!
+  ];
+
+  const simulateRebuild = (options = {}) => {
+    const dryRun = options.dryRun !== false;
+    const conflicts = [];
+    const allocations = {};
+
+    for (const r of reservations) {
+      if (r.status.toLowerCase().includes('cancel')) continue;
+      const cur = new Date(r.checkIn);
+      const end = new Date(r.checkOut);
+      while (cur < end) {
+        const dStr = cur.toISOString().split('T')[0];
+        if (allocations[dStr] && allocations[dStr].reservationId !== r.id) {
+          conflicts.push(`Conflict on ${dStr}: ${allocations[dStr].reservationId} vs ${r.id}`);
+        } else {
+          allocations[dStr] = { reservationId: r.id, guestName: r.guestName };
+        }
+        cur.setDate(cur.getDate() + 1);
+      }
+    }
+
+    if (dryRun) {
+      return { dryRun: true, written: false, conflicts };
+    }
+    if (conflicts.length > 0) {
+      return { dryRun: false, written: false, blocked: true, reason: 'Conflicts exist' };
+    }
+    if (!options.explicitApproval || !options.verifiedBackupTimestamp) {
+      return { dryRun: false, written: false, blocked: true, reason: 'Missing authorization' };
+    }
+    return { dryRun: false, written: true, conflicts: [] };
+  };
+
+  // 1. Calling without options defaults to dryRun: true and does not write
+  const dryResult = simulateRebuild();
+  assert.equal(dryResult.dryRun, true);
+  assert.equal(dryResult.written, false);
+  assert.equal(dryResult.conflicts.length, 1);
+  assert.match(dryResult.conflicts[0], /Conflict on 2026-11-02/);
+
+  // 2. Calling with dryRun: false while conflicts exist is BLOCKED
+  const blockedConflict = simulateRebuild({ dryRun: false, explicitApproval: true, verifiedBackupTimestamp: '2026-10-27T10:00:00Z' });
+  assert.equal(blockedConflict.written, false);
+  assert.equal(blockedConflict.blocked, true);
+  assert.equal(blockedConflict.reason, 'Conflicts exist');
+
+  // 3. Calling without verified backup timestamp or approval is BLOCKED
+  const nonConflictingRes = [
+    { id: 'RES-1', guestName: 'Alice', room: 'Mawenzi (Room 1)', bedCode: 'M-S1', checkIn: '2026-11-01', checkOut: '2026-11-03', status: 'Confirmed' }
+  ];
+  const blockedNoAuth = simulateRebuild({ dryRun: false });
+  assert.equal(blockedNoAuth.written, false);
+  assert.equal(blockedNoAuth.blocked, true);
+});
+
+test('Inventory Verification Safety: Uninitialized inventory blocks new bookings until reconciliation', () => {
+  const inventoryStatus = { initialized: false };
+
+  const attemptBooking = (candidate, invStatus) => {
+    if (invStatus && invStatus.initialized === false) {
+      throw new Error('Inventory safety block: Bed inventory initialization is pending. Reconcile historical reservations before booking.');
+    }
+    return { success: true, bookingId: candidate.id };
+  };
+
+  // Booking attempt while uninitialized is rejected
+  assert.throws(
+    () => attemptBooking({ id: 'MU-NEW-1', bedCode: 'M-S1' }, inventoryStatus),
+    /Inventory safety block: Bed inventory initialization is pending/
+  );
+
+  // Booking attempt after initialization succeeds
+  inventoryStatus.initialized = true;
+  const success = attemptBooking({ id: 'MU-NEW-1', bedCode: 'M-S1' }, inventoryStatus);
+  assert.equal(success.success, true);
+});

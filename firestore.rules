@@ -34,13 +34,15 @@ service cloud.firestore {
       return isSignedIn()
         && request.auth.token.email != null
         && exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
-        && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.get('status', 'active') == 'suspended';
+        && ('status' in get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data)
+        && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.status == 'suspended';
     }
 
-    // System bootstrap administrators
+    // System bootstrap administrators: ONLY used for initial provisioning if no authoritative record exists in user_roles
     function isBootstrapAdmin() {
       return isSignedIn()
         && request.auth.token.email != null
+        && !exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
         && request.auth.token.email in [
           'designkilifair@gmail.com',
           'wolfgodie@gmail.com',
@@ -55,19 +57,19 @@ service cloud.firestore {
         && !isSuspended()
         && (
           (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
-            && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.get('status', 'active') == 'active')
-          || (!exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email)) && isBootstrapAdmin())
+            && (!('status' in get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data)
+                || get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.status == 'active'))
+          || isBootstrapAdmin()
         );
     }
 
-    // System Administrator: authoritative user_roles takes precedence, fallback to bootstrap list
+    // System Administrator: authoritative user_roles takes precedence, fallback to bootstrap list only if unprovisioned
     function isAdmin() {
       return isApprovedUser()
         && (
           (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
             && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.role == 'admin')
-          || (!exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
-            && isBootstrapAdmin())
+          || isBootstrapAdmin()
         );
     }
 
@@ -182,14 +184,14 @@ service cloud.firestore {
 
     // 1. Reservations Collection
     // Read: Authenticated approved staff and managers only (NO public reads!)
-    // Create & Update: Approved staff, managers, and admins with full schema validation
+    // Create & Update: Property Managers and Admins with full schema validation
     // Delete: Admins only
     match /reservations/{reservationId} {
       allow get, list: if isStaff();
-      allow create: if isStaff()
+      allow create: if isPropertyManager()
         && isValidId(reservationId)
         && isValidReservation(incoming());
-      allow update: if isStaff()
+      allow update: if isPropertyManager()
         && isValidId(reservationId)
         && isValidReservation(incoming())
         && incoming().id == existing().id;
@@ -198,14 +200,14 @@ service cloud.firestore {
 
     // 2. Guests Collection
     // Read: Authenticated approved staff
-    // Create & Update: Approved staff, managers, and admins
+    // Create & Update: Property Managers and Admins
     // Delete: Admins only
     match /guests/{guestId} {
       allow get, list: if isStaff();
-      allow create: if isStaff()
+      allow create: if isPropertyManager()
         && isValidId(guestId)
         && isValidGuest(incoming());
-      allow update: if isStaff()
+      allow update: if isPropertyManager()
         && isValidId(guestId)
         && isValidGuest(incoming())
         && incoming().id == existing().id;
@@ -214,12 +216,12 @@ service cloud.firestore {
 
     // 3. Payments Collection
     // Read: Authenticated approved staff
-    // Create: Approved staff, managers, and admins (idempotent payment records)
+    // Create: Property Managers and Admins (idempotent payment records)
     // Update: Admins only (financial adjustments)
     // Delete: Admins only
     match /payments/{paymentId} {
       allow get, list: if isStaff();
-      allow create: if isStaff()
+      allow create: if isPropertyManager()
         && isValidId(paymentId)
         && isValidPayment(incoming());
       allow update: if isAdmin()
@@ -250,24 +252,27 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // 6. Audit Logs Collection
+    // 6. Audit Logs Collection: Strictly Append-Only (Tamper-Proof)
     match /audit_logs/{logId} {
       allow get, list: if isStaff();
-      allow create: if isStaff() && isValidId(logId) && isValidAuditLog(incoming());
-      allow update, delete: if isAdmin();
+      allow create: if isStaff()
+        && isValidId(logId)
+        && isValidAuditLog(incoming())
+        && !exists(/databases/$(database)/documents/audit_logs/$(logId));
+      allow update, delete: if false;
     }
 
-    // 7. Bed Schedules Collection (atomic concurrency protection)
+    // 7. Bed Schedules Collection (atomic concurrency protection - Manager & Admin only)
     match /bed_schedules/{bedCode} {
       allow get, list: if isStaff();
-      allow create, update: if isStaff() && isValidId(bedCode);
+      allow create, update: if isPropertyManager() && isValidId(bedCode);
       allow delete: if isAdmin() && isValidId(bedCode);
     }
 
-    // 8. Counters Collection (unique ID generation)
+    // 8. Counters Collection (unique ID generation - Manager & Admin only)
     match /counters/{counterId} {
       allow get: if isStaff();
-      allow create, update: if isStaff() && isValidId(counterId);
+      allow create, update: if isPropertyManager() && isValidId(counterId);
       allow delete: if isAdmin() && isValidId(counterId);
     }
   }

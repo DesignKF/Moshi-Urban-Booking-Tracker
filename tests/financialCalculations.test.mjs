@@ -218,3 +218,74 @@ test('Financial Correctness: Creating booking with initial deposit counts deposi
   assert.equal(updated.balanceDue, 20, 'Editing booking must preserve balanceDue');
   assert.equal(paymentLedger.size, 1, 'No duplicate payment created during booking edit');
 });
+
+test('Financial Correctness: Two distinct legitimate payments of the exact same amount must both be accepted', () => {
+  const paymentLedger = new Map();
+  let reservation = {
+    id: 'MU-SPLIT-1',
+    totalAmount: 100,
+    paidAmount: 0,
+    balanceDue: 100
+  };
+
+  const processPayment = (payment) => {
+    // Read Phase
+    const existing = paymentLedger.get(payment.id);
+    if (existing) {
+      if (
+        existing.amount === payment.amount &&
+        existing.currency === payment.currency &&
+        existing.type === payment.type &&
+        existing.reservationId === payment.reservationId
+      ) {
+        return { success: true, idempotentRetry: true };
+      }
+      throw new Error(`Conflicting payment transaction for ID ${payment.id}`);
+    }
+
+    // Write Phase
+    reservation.paidAmount += payment.amount;
+    reservation.balanceDue = Math.max(0, reservation.totalAmount - reservation.paidAmount);
+    paymentLedger.set(payment.id, { ...payment });
+    return { success: true, idempotentRetry: false };
+  };
+
+  // Payment 1: Guest pays $25 deposit at booking time
+  const pay1 = {
+    id: 'PAY-MU-SPLIT-1-deposit-seq001',
+    reservationId: 'MU-SPLIT-1',
+    amount: 25,
+    currency: 'USD',
+    type: 'deposit'
+  };
+  const res1 = processPayment(pay1);
+  assert.equal(res1.idempotentRetry, false);
+  assert.equal(reservation.paidAmount, 25);
+  assert.equal(reservation.balanceDue, 75);
+
+  // Payment 2: Guest pays ANOTHER $25 installment later (exact same amount, different payment operation ID)
+  const pay2 = {
+    id: 'PAY-MU-SPLIT-1-installment-seq002',
+    reservationId: 'MU-SPLIT-1',
+    amount: 25,
+    currency: 'USD',
+    type: 'installment'
+  };
+  const res2 = processPayment(pay2);
+  assert.equal(res2.idempotentRetry, false, 'Second distinct payment of same amount must be accepted');
+  assert.equal(reservation.paidAmount, 50, 'Paid amount must reflect both legitimate $25 payments');
+  assert.equal(reservation.balanceDue, 50, 'Balance due must reflect remaining $50');
+  assert.equal(paymentLedger.size, 2);
+
+  // Retry Payment 1 (network disconnect recovery)
+  const retry1 = processPayment(pay1);
+  assert.equal(retry1.idempotentRetry, true);
+  assert.equal(reservation.paidAmount, 50, 'Retry of Payment 1 must not increase paid balance');
+  assert.equal(reservation.balanceDue, 50);
+
+  // Retry Payment 2 (network disconnect recovery)
+  const retry2 = processPayment(pay2);
+  assert.equal(retry2.idempotentRetry, true);
+  assert.equal(reservation.paidAmount, 50, 'Retry of Payment 2 must not increase paid balance');
+  assert.equal(reservation.balanceDue, 50);
+});
