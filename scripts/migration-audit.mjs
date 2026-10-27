@@ -120,10 +120,10 @@ export function audit(sheet,firestore){
       const r=records[i],fields=[];
       for(const key of ['checkIn','checkOut']){
         const raw=String(r[key]??'').trim();
-        if(raw && !/^\\d{4}-\\d{2}-\\d{2}$/.test(normalizeDate(raw)))fields.push(key+' (unrecognized date)');
+        if(raw && !/^\d{4}-\d{2}-\d{2}$/.test(normalizeDate(raw)))fields.push(key+' (unrecognized date)');
       }
       const start=normalizeDate(r.checkIn),end=normalizeDate(r.checkOut);
-      if(/^\\d{4}-\\d{2}-\\d{2}$/.test(start)&&/^\\d{4}-\\d{2}-\\d{2}$/.test(end)&&end<=start)fields.push('date range');
+      if(/^\d{4}-\d{2}-\d{2}$/.test(start)&&/^\d{4}-\d{2}-\d{2}$/.test(end)&&end<=start)fields.push('date range');
       for(const key of ['totalAmount','paidAmount','balanceDue']){
         const raw=String(r[key]??'').trim();
         if(raw && money(raw)===null)fields.push(key+' (invalid amount)');
