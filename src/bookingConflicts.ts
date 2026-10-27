@@ -253,3 +253,43 @@ export function checkNewBookingConflict(
 
   return null;
 }
+
+/**
+ * Returns all individual date keys (YYYY-MM-DD) for each occupied night [checkIn, checkOut).
+ * Checkout date is NOT an occupied night.
+ */
+export function getNightsList(checkIn: string, checkOut: string): string[] {
+  if (!checkIn || !checkOut || checkIn >= checkOut) return [];
+  const nights: string[] = [];
+  const current = new Date(checkIn);
+  const end = new Date(checkOut);
+
+  while (current < end) {
+    const y = current.getFullYear();
+    const m = String(current.getMonth() + 1).padStart(2, '0');
+    const d = String(current.getDate()).padStart(2, '0');
+    nights.push(`${y}-${m}-${d}`);
+    current.setDate(current.getDate() + 1);
+  }
+  return nights;
+}
+
+/**
+ * Returns all related bed codes that must be checked for mutual exclusion.
+ * - If whole room (contains ALL), returns all bed codes in the room.
+ * - If single bed, returns [bedCode, wholeRoomCode].
+ */
+export function getRelatedBedCodes(roomName: string, bedCode: string): string[] {
+  const norm = normalizeRoomName(roomName);
+  const room = HOSTEL_ROOMS.find(r => r.name.toLowerCase() === norm || r.id === norm);
+  if (!room) return [bedCode];
+
+  const allBedCodes = room.units.map(u => u.id);
+  const wholeRoomCode = allBedCodes.find(code => code.includes('ALL'));
+
+  if (bedCode.includes('ALL')) {
+    return allBedCodes;
+  }
+
+  return wholeRoomCode ? [bedCode, wholeRoomCode] : [bedCode];
+}

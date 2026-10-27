@@ -16,6 +16,8 @@ import {
   subscribeToReservations,
   subscribeToUserRoles,
   fetchReservationsFromFirestore,
+  allocateNextBookingId,
+  recordPaymentTransaction,
   isAuthorizedAdminEmail,
   isAuthorizedPropertyManagerOrAdmin,
   getUserRole,
@@ -1535,8 +1537,13 @@ export default function App() {
     }
 
     const isNew = !editingBooking;
+    let assignedId = formData.id;
+    if (isNew) {
+      assignedId = await allocateNextBookingId(reservations);
+    }
+
     const finalRecord: Reservation = {
-      id: formData.id || `MU-${reservations.length + 1}`,
+      id: assignedId,
       guestId: formData.guestId.trim() || generateGuestId(formData.guestName, reservations.map(r => r.guestId || '')),
       guestName: formData.guestName.trim(),
       email: formData.email.trim(),
@@ -1560,6 +1567,22 @@ export default function App() {
     // Attempt authoritative Firestore write with double-booking prevention BEFORE closing form modal
     try {
       await saveReservationToFirestore(finalRecord);
+
+      // Record initial payment ledger entry ONLY for brand new bookings that have a paid deposit:
+      if (isNew && finalRecord.paidAmount > 0) {
+        await recordPaymentTransaction({
+          id: `PAY-${finalRecord.id}-deposit`,
+          reservationId: finalRecord.id,
+          guestId: finalRecord.guestId,
+          amount: finalRecord.paidAmount,
+          currency: finalRecord.currency || 'USD',
+          type: finalRecord.balanceDue === 0 ? 'full' : 'deposit',
+          method: 'BookingPlatform',
+          recordedBy: user?.email || 'admin',
+          notes: `Initial deposit with new booking ${finalRecord.id}`,
+          createdAt: new Date().toISOString()
+        }).catch(e => console.warn('Payment transaction record note:', e));
+      }
 
       // Optional background sync to connected Google Sheet
       const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
@@ -1703,7 +1726,22 @@ export default function App() {
     );
     setReservations(prev => prev.map(r => (r.id === b.id ? updated : r)));
     try {
-      await saveReservationToFirestore(updated);
+      if (b.balanceDue > 0) {
+        await recordPaymentTransaction({
+          id: `PAY-${b.id}-${Date.now()}`,
+          reservationId: b.id,
+          guestId: b.guestId,
+          amount: b.balanceDue,
+          currency: (b.currency as any) || 'USD',
+          type: 'balance',
+          method: 'Cash',
+          recordedBy: user?.email || 'admin',
+          notes: `Collected remaining balance for ${b.guestName}`,
+          createdAt: new Date().toISOString()
+        });
+      } else {
+        await saveReservationToFirestore(updated);
+      }
       const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
       if (activeSheetId) {
         saveReservationToSheet(updated, false).catch(() => {});
@@ -2098,27 +2136,36 @@ export default function App() {
       setReservations(updatedList);
 
       // Persist to Firestore and Google Sheets for selected items
-      const selectedRecords = updatedList.filter(r => selectedBookingIds.includes(r.id));
+      const selectedRecords = reservations.filter(r => selectedBookingIds.includes(r.id));
       const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
       const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Booking overview';
       const currentToken = await getAccessToken();
 
+      let successCount = 0;
+      const failedIds: string[] = [];
+
       for (const rec of selectedRecords) {
+        const updatedRec: Reservation = { ...rec, status: newStatus };
         try {
-          await saveReservationToFirestore(rec);
-        } catch (fsErr) {
-          console.warn('Firestore batch status note:', fsErr);
-        }
-        if (currentToken && activeSheetId) {
-          try {
-            await updateReservationInSheet(activeSheetId, activeTab, rec, currentToken);
-          } catch (shErr) {
-            console.warn('Sheet batch status note:', shErr);
+          await saveReservationToFirestore(updatedRec);
+          successCount++;
+          if (currentToken && activeSheetId) {
+            updateReservationInSheet(activeSheetId, activeTab, updatedRec, currentToken).catch(() => {});
           }
+        } catch (fsErr: any) {
+          console.error(`Firestore batch status update failed for ${rec.id}:`, fsErr);
+          failedIds.push(rec.id);
         }
       }
 
-      triggerToast(`Batch updated ${count} bookings to "${newStatus}" & synced!`, 'success');
+      if (failedIds.length > 0) {
+        // Rollback state for failed records
+        setReservations(prev => prev.map(r => failedIds.includes(r.id) ? (snapshotBefore.find(orig => orig.id === r.id) || r) : (selectedBookingIds.includes(r.id) ? { ...r, status: newStatus } : r)));
+        triggerToast(`Updated ${successCount} bookings. Failed to update ${failedIds.length} bookings: ${failedIds.join(', ')}`, 'error');
+      } else {
+        setReservations(prev => prev.map(r => selectedBookingIds.includes(r.id) ? { ...r, status: newStatus } : r));
+        triggerToast(`Batch updated all ${count} bookings to "${newStatus}"!`, 'success');
+      }
       setSelectedBookingIds([]);
     } catch (err: any) {
       triggerToast(`Batch status update failed: ${err.message}`, 'error');
@@ -2135,16 +2182,6 @@ export default function App() {
     setIsBatchProcessing(true);
     try {
       const snapshotBefore = [...reservations];
-      const updatedList = reservations.map(r => {
-        if (selectedBookingIds.includes(r.id)) {
-          return {
-            ...r,
-            paidAmount: r.totalAmount,
-            balanceDue: 0
-          };
-        }
-        return r;
-      });
       pushUndo(`Batch collected payment for ${count} bookings`, snapshotBefore);
       recordChange(
         'payment',
@@ -2155,29 +2192,51 @@ export default function App() {
         `Balances marked fully paid`,
         snapshotBefore
       );
-      setReservations(updatedList);
 
-      const selectedRecords = updatedList.filter(r => selectedBookingIds.includes(r.id));
+      const selectedRecords = reservations.filter(r => selectedBookingIds.includes(r.id));
       const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
       const activeTab = selectedTabName || localStorage.getItem('muh_active_tab_name') || 'Booking overview';
       const currentToken = await getAccessToken();
 
+      let successCount = 0;
+      const failedIds: string[] = [];
+
       for (const rec of selectedRecords) {
         try {
-          await saveReservationToFirestore(rec);
-        } catch (fsErr) {
-          console.warn('Firestore batch collect note:', fsErr);
-        }
-        if (currentToken && activeSheetId) {
-          try {
-            await updateReservationInSheet(activeSheetId, activeTab, rec, currentToken);
-          } catch (shErr) {
-            console.warn('Sheet batch collect note:', shErr);
+          const balance = rec.balanceDue || 0;
+          if (balance > 0) {
+            await recordPaymentTransaction({
+              id: `PAY-BATCH-${rec.id}-${Date.now()}`,
+              reservationId: rec.id,
+              guestId: rec.guestId,
+              amount: balance,
+              currency: (rec.currency as any) || 'USD',
+              type: 'balance',
+              method: 'Batch Settlement',
+              recordedBy: user?.email || 'admin',
+              notes: `Batch balance settlement for booking ${rec.id}`,
+              createdAt: new Date().toISOString()
+            });
+          } else {
+            await saveReservationToFirestore({ ...rec, paidAmount: rec.totalAmount, balanceDue: 0 });
           }
+          successCount++;
+          if (currentToken && activeSheetId) {
+            updateReservationInSheet(activeSheetId, activeTab, { ...rec, paidAmount: rec.totalAmount, balanceDue: 0 }, currentToken).catch(() => {});
+          }
+        } catch (payErr: any) {
+          console.error(`Batch payment collection failed for ${rec.id}:`, payErr);
+          failedIds.push(rec.id);
         }
       }
 
-      triggerToast(`Batch marked ${count} bookings as fully paid & synced!`, 'success');
+      if (failedIds.length > 0) {
+        setReservations(prev => prev.map(r => failedIds.includes(r.id) ? (snapshotBefore.find(orig => orig.id === r.id) || r) : (selectedBookingIds.includes(r.id) ? { ...r, paidAmount: r.totalAmount, balanceDue: 0 } : r)));
+        triggerToast(`Settled ${successCount} bookings. Failed for ${failedIds.length} bookings: ${failedIds.join(', ')}`, 'error');
+      } else {
+        setReservations(prev => prev.map(r => selectedBookingIds.includes(r.id) ? { ...r, paidAmount: r.totalAmount, balanceDue: 0 } : r));
+        triggerToast(`Batch marked ${count} bookings as fully paid and recorded in ledger!`, 'success');
+      }
       setSelectedBookingIds([]);
     } catch (err: any) {
       triggerToast(`Batch collect failed: ${err.message}`, 'error');
@@ -7186,12 +7245,15 @@ export default function App() {
                                     setConfirmModal(prev => ({ ...prev, isOpen: false }));
                                     const updated = { ...conflict.reservationA, status: 'Cancelled' };
                                     try {
-                                      await saveReservationToSheet(updated, false);
-                                      try { await saveReservationToFirestore(updated); } catch (e) {}
+                                      await saveReservationToFirestore(updated);
+                                      const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+                                      if (activeSheetId) {
+                                        saveReservationToSheet(updated, false).catch(() => {});
+                                      }
                                       setReservations(prev => prev.map(r => r.id === updated.id ? updated : r));
                                       triggerToast(`Cancelled ${conflict.reservationA.id} to resolve conflict`, 'success');
                                     } catch (err: any) {
-                                      triggerToast(`Failed to cancel: ${err.message}`, 'error');
+                                      triggerToast(`Failed to cancel ${conflict.reservationA.id}: ${err.message}`, 'error');
                                     }
                                   }
                                 });
@@ -7243,12 +7305,15 @@ export default function App() {
                                       setConfirmModal(prev => ({ ...prev, isOpen: false }));
                                       const updated = { ...conflict.reservationB!, status: 'Cancelled' };
                                       try {
-                                        await saveReservationToSheet(updated, false);
-                                        try { await saveReservationToFirestore(updated); } catch (e) {}
+                                        await saveReservationToFirestore(updated);
+                                        const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+                                        if (activeSheetId) {
+                                          saveReservationToSheet(updated, false).catch(() => {});
+                                        }
                                         setReservations(prev => prev.map(r => r.id === updated.id ? updated : r));
                                         triggerToast(`Cancelled ${conflict.reservationB!.id} to resolve conflict`, 'success');
                                       } catch (err: any) {
-                                        triggerToast(`Failed to cancel: ${err.message}`, 'error');
+                                        triggerToast(`Failed to cancel ${conflict.reservationB!.id}: ${err.message}`, 'error');
                                       }
                                     }
                                   });

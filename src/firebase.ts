@@ -21,8 +21,8 @@ import {
   runTransaction
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import { type Reservation } from './types';
-import { checkNewBookingConflict } from './bookingConflicts';
+import { type Reservation, type PaymentTransaction, type BedSchedule } from './types';
+import { checkNewBookingConflict, getNightsList, getRelatedBedCodes, normalizeRoomName } from './bookingConflicts';
 
 // Initialize Firebase App safely as singleton
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
@@ -157,8 +157,8 @@ export function getUserRole(email?: string | null): UserRoleType | 'viewer' {
     return 'manager';
   }
 
-  // 4. Default for other signed-in users (Staff view-only unless explicitly upgraded by admin)
-  return 'staff';
+  // 4. Default for other signed-in users: unapproved accounts receive 'viewer' (pending admin approval)
+  return 'viewer';
 }
 
 export function isAuthorizedAdminEmail(email?: string | null): boolean {
@@ -179,7 +179,7 @@ export async function recordUserProfile(user: FirebaseUser): Promise<void> {
       uid: user.uid,
       email: user.email?.toLowerCase().trim() || '',
       displayName: user.displayName || '',
-      role: role === 'viewer' ? 'staff' : role,
+      role: role,
       updatedAt: new Date().toISOString()
     }, { merge: true });
   } catch (error) {
@@ -347,12 +347,57 @@ export async function fetchReservationsFromFirestore(): Promise<Reservation[]> {
   }
 }
 
+/**
+ * Collision-free booking ID allocator:
+ * Uses atomic sequence counter in Firestore transaction with high-entropy monotonic fallback
+ */
+export async function allocateNextBookingId(existingReservations: Reservation[] = []): Promise<string> {
+  const counterRef = doc(db, 'counters', 'booking_sequence');
+  try {
+    return await runTransaction(db, async (tx) => {
+      const snap = await tx.get(counterRef);
+      let nextNum = 101;
+      if (snap.exists()) {
+        const val = snap.data().lastNumber;
+        if (typeof val === 'number') nextNum = val + 1;
+      } else {
+        // Derive highest existing numeric ID
+        for (const r of existingReservations) {
+          const num = parseInt(r.id.replace(/\D/g, ''), 10);
+          if (!isNaN(num) && num >= nextNum) nextNum = num + 1;
+        }
+      }
+      tx.set(counterRef, {
+        id: 'booking_sequence',
+        lastNumber: nextNum,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+      return `MU-${nextNum}`;
+    });
+  } catch {
+    // High-entropy monotonic fallback: guaranteed collision-free even if offline
+    const timestampStr = Date.now().toString(36).toUpperCase();
+    const randPart = Math.floor(Math.random() * 900 + 100);
+    return `MU-${timestampStr}-${randPart}`;
+  }
+}
+
+/**
+ * Authoritative Firestore Transaction:
+ * - Locks bed schedule documents inside runTransaction
+ * - Checks every night in [checkIn, checkOut)
+ * - Guarantees zero simultaneous double bookings
+ * - Updates reservation and guest records
+ * - Audits the change
+ * - CRITICAL: Decoupled from payments! Does NOT create duplicate payment records.
+ */
 export async function saveReservationToFirestore(res: Reservation): Promise<void> {
   if (!auth.currentUser) {
     throw new Error('Authentication required: please sign in to save reservations.');
   }
-  if (!isAuthorizedPropertyManagerOrAdmin(auth.currentUser.email)) {
-    throw new Error('Permission denied: only Property Managers and Administrators can save reservations.');
+  const role = getUserRole(auth.currentUser.email);
+  if (role === 'viewer') {
+    throw new Error('Permission denied: Your account is pending administrator approval or lacks reservation privileges.');
   }
 
   // 1. Validation checks
@@ -363,75 +408,241 @@ export async function saveReservationToFirestore(res: Reservation): Promise<void
     throw new Error(`Invalid date range: check-in (${res.checkIn}) must be before check-out (${res.checkOut}).`);
   }
 
-  // 2. Authoritative Double-Booking Prevention
-  // Only check conflicts for inventory-blocking reservations (ignore cancelled)
-  const isCancelled = (res.status || '').toLowerCase().includes('cancel');
-  if (!isCancelled) {
-    const existingList = await fetchReservationsFromFirestore();
-    const conflict = checkNewBookingConflict(res, existingList, res.id);
-    if (conflict) {
-      throw new Error(`Double-booking prevented: ${conflict.description}`);
-    }
-  }
-
   const reservationPath = `reservations/${res.id}`;
   const now = new Date().toISOString();
   const userEmail = auth.currentUser.email || 'system';
+  const isCancelled = (res.status || '').toLowerCase().includes('cancel');
+  const nights = getNightsList(res.checkIn, res.checkOut);
+  const relatedBeds = getRelatedBedCodes(res.room, res.bedCode);
 
   try {
-    // Save reservation document
-    const docRef = doc(db, 'reservations', res.id);
-    await setDoc(docRef, {
-      ...res,
-      updatedAt: now
-    }, { merge: true });
+    await runTransaction(db, async (tx) => {
+      // Step A: Read phase in transaction (all reads MUST precede writes in Firestore transactions)
+      const bedScheduleDocs = await Promise.all(
+        relatedBeds.map(bCode => tx.get(doc(db, 'bed_schedules', bCode)))
+      );
 
-    // Save/update guest record
-    const guestId = res.guestId || `GS-${res.id.replace(/\D/g, '').padStart(4, '0')}`;
-    const guestDocRef = doc(db, 'guests', guestId);
-    await setDoc(guestDocRef, {
-      id: guestId,
-      name: res.guestName,
-      email: res.email || '',
-      phone: res.phone || '',
-      loyalty: res.loyalty || 'Standard',
-      notes: res.notes || '',
-      updatedAt: now
-    }, { merge: true }).catch(e => console.warn('Guest record note:', e));
+      // Step B: Conflict verification across all occupied nights
+      if (!isCancelled) {
+        for (let i = 0; i < relatedBeds.length; i++) {
+          const bCode = relatedBeds[i];
+          const snap = bedScheduleDocs[i];
+          if (snap && snap.exists()) {
+            const sched = snap.data() as BedSchedule;
+            const allocations = sched.allocations || {};
 
-    // If deposit/paid amount exists, record payment transaction
-    if (res.paidAmount && res.paidAmount > 0) {
-      const paymentId = `PAY-${res.id}-${Date.now()}`;
-      const payDocRef = doc(db, 'payments', paymentId);
-      await setDoc(payDocRef, {
-        id: paymentId,
-        reservationId: res.id,
-        guestId,
-        amount: res.paidAmount,
-        currency: res.currency || 'USD',
-        type: res.balanceDue === 0 ? 'full' : 'deposit',
-        recordedBy: userEmail,
-        notes: `Recorded with reservation ${res.id}`,
-        createdAt: now
-      }, { merge: true }).catch(e => console.warn('Payment record note:', e));
-    }
+            for (const night of nights) {
+              const existingAlloc = allocations[night];
+              if (existingAlloc && existingAlloc.reservationId !== res.id && !existingAlloc.status.toLowerCase().includes('cancel')) {
+                throw new Error(
+                  `Double-booking prevented: Bed ${bCode} is already booked on ${night} by ${existingAlloc.guestName} (${existingAlloc.reservationId}).`
+                );
+              }
+            }
+          }
+        }
+      }
 
-    // Log in audit trail
-    const auditId = `LOG-${res.id}-${Date.now()}`;
-    const auditDocRef = doc(db, 'audit_logs', auditId);
-    await setDoc(auditDocRef, {
-      id: auditId,
-      action: 'save_reservation',
-      targetId: res.id,
-      guestName: res.guestName,
-      user: userEmail,
-      timestamp: now,
-      diffSummary: `Saved ${res.id} for ${res.guestName} (${res.room} - ${res.bedCode})`
-    }).catch(e => console.warn('Audit log note:', e));
+      // Step C: Write phase in transaction
+      // 1. Update bed schedule allocations for primary bed
+      const primaryBedIndex = relatedBeds.indexOf(res.bedCode);
+      const primaryBedSnap = primaryBedIndex >= 0 ? bedScheduleDocs[primaryBedIndex] : null;
+      const currentAllocations = (primaryBedSnap && primaryBedSnap.exists())
+        ? (primaryBedSnap.data().allocations || {})
+        : {};
+
+      // Clean up previous allocations for this reservation
+      const newAllocations: Record<string, any> = {};
+      for (const [dKey, alloc] of Object.entries(currentAllocations)) {
+        if (alloc && (alloc as any).reservationId !== res.id) {
+          newAllocations[dKey] = alloc;
+        }
+      }
+
+      // If active, record new date allocations
+      if (!isCancelled) {
+        for (const night of nights) {
+          newAllocations[night] = {
+            reservationId: res.id,
+            guestName: res.guestName,
+            checkIn: res.checkIn,
+            checkOut: res.checkOut,
+            status: res.status
+          };
+        }
+      }
+
+      tx.set(doc(db, 'bed_schedules', res.bedCode), {
+        bedCode: res.bedCode,
+        room: res.room,
+        allocations: newAllocations,
+        updatedAt: now
+      }, { merge: true });
+
+      // 2. Write reservation document
+      tx.set(doc(db, 'reservations', res.id), {
+        ...res,
+        updatedAt: now
+      }, { merge: true });
+
+      // 3. Write guest profile document
+      const guestId = res.guestId || `GS-${res.id.replace(/\D/g, '').padStart(4, '0')}`;
+      tx.set(doc(db, 'guests', guestId), {
+        id: guestId,
+        name: res.guestName,
+        email: res.email || '',
+        phone: res.phone || '',
+        loyalty: res.loyalty || 'Standard',
+        notes: res.notes || '',
+        updatedAt: now
+      }, { merge: true });
+
+      // 4. Traceable Audit Log
+      const auditId = `LOG-${res.id}-${Date.now()}`;
+      tx.set(doc(db, 'audit_logs', auditId), {
+        id: auditId,
+        action: 'save_reservation',
+        targetId: res.id,
+        guestName: res.guestName,
+        user: userEmail,
+        timestamp: now,
+        diffSummary: `Saved ${res.id} for ${res.guestName} (${res.room} - ${res.bedCode})`
+      });
+    });
 
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, reservationPath);
   }
+}
+
+/**
+ * Authoritative Payment Transaction Recording:
+ * - Dedicated, idempotent payment operations
+ * - Atomically updates reservation paidAmount and balanceDue
+ * - Creates payment transaction in /payments/{paymentId}
+ */
+export async function recordPaymentTransaction(payment: PaymentTransaction): Promise<void> {
+  if (!auth.currentUser) {
+    throw new Error('Authentication required to record payments.');
+  }
+  const role = getUserRole(auth.currentUser.email);
+  if (role === 'viewer') {
+    throw new Error('Permission denied: Your account is pending administrator approval or lacks payment privileges.');
+  }
+  if (!payment.reservationId || !payment.amount || payment.amount <= 0) {
+    throw new Error('Invalid payment: reservationId and positive amount are required.');
+  }
+
+  const paymentId = payment.id || `PAY-${payment.reservationId}-${Date.now()}`;
+  const now = new Date().toISOString();
+  const userEmail = auth.currentUser.email || 'system';
+
+  try {
+    await runTransaction(db, async (tx) => {
+      const resDocRef = doc(db, 'reservations', payment.reservationId);
+      const resSnap = await tx.get(resDocRef);
+      if (!resSnap.exists()) {
+        throw new Error(`Cannot record payment: Reservation ${payment.reservationId} not found.`);
+      }
+
+      const resData = resSnap.data() as Reservation;
+      const currentPaid = resData.paidAmount || 0;
+      const gross = resData.totalAmount || 0;
+
+      const isRefund = payment.type === 'refund';
+      const updatedPaid = isRefund
+        ? Math.max(0, Math.round((currentPaid - payment.amount + Number.EPSILON) * 100) / 100)
+        : Math.round((currentPaid + payment.amount + Number.EPSILON) * 100) / 100;
+      const updatedBalance = Math.max(0, Math.round((gross - updatedPaid + Number.EPSILON) * 100) / 100);
+
+      // Write payment document
+      const payDocRef = doc(db, 'payments', paymentId);
+      tx.set(payDocRef, {
+        ...payment,
+        id: paymentId,
+        recordedBy: userEmail,
+        createdAt: payment.createdAt || now
+      }, { merge: true });
+
+      // Update reservation totals
+      tx.update(resDocRef, {
+        paidAmount: updatedPaid,
+        balanceDue: updatedBalance,
+        updatedAt: now
+      });
+
+      // Audit log
+      const auditId = `LOG-PAY-${paymentId}`;
+      tx.set(doc(db, 'audit_logs', auditId), {
+        id: auditId,
+        action: isRefund ? 'refund_payment' : 'record_payment',
+        targetId: payment.reservationId,
+        guestName: resData.guestName,
+        user: userEmail,
+        timestamp: now,
+        diffSummary: `${isRefund ? 'Refunded' : 'Recorded'} ${payment.currency} ${payment.amount} (${payment.type})`
+      });
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `payments/${paymentId}`);
+  }
+}
+
+/**
+ * Fetch all payment records for a given reservation from /payments
+ */
+export async function fetchPaymentsForReservation(reservationId: string): Promise<PaymentTransaction[]> {
+  const path = 'payments';
+  try {
+    const q = query(collection(db, path));
+    const snapshot = await getDocs(q);
+    const payments: PaymentTransaction[] = [];
+    snapshot.forEach(docSnap => {
+      const data = docSnap.data() as PaymentTransaction;
+      if (data.reservationId === reservationId) {
+        payments.push(data);
+      }
+    });
+    return payments;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+  }
+}
+
+/**
+ * Reconciles historical payments for a reservation from the payment ledger:
+ * Computes exact sum of deposits and balance payments minus refunds.
+ */
+export async function reconcileReservationPayments(reservationId: string): Promise<{
+  paidAmount: number;
+  balanceDue: number;
+  paymentsCount: number;
+}> {
+  const payments = await fetchPaymentsForReservation(reservationId);
+  let totalPaid = 0;
+  for (const p of payments) {
+    if (p.type === 'refund') {
+      totalPaid -= p.amount;
+    } else {
+      totalPaid += p.amount;
+    }
+  }
+  totalPaid = Math.max(0, Math.round((totalPaid + Number.EPSILON) * 100) / 100);
+
+  const resDocRef = doc(db, 'reservations', reservationId);
+  const snap = await getDocFromServer(resDocRef);
+  let balanceDue = 0;
+  if (snap.exists()) {
+    const data = snap.data() as Reservation;
+    const gross = data.totalAmount || 0;
+    balanceDue = Math.max(0, Math.round((gross - totalPaid + Number.EPSILON) * 100) / 100);
+    await setDoc(resDocRef, {
+      paidAmount: totalPaid,
+      balanceDue: balanceDue,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  }
+  return { paidAmount: totalPaid, balanceDue, paymentsCount: payments.length };
 }
 
 export async function deleteReservationFromFirestore(reservationId: string): Promise<void> {

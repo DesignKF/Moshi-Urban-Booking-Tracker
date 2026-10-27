@@ -345,6 +345,49 @@
         }
       },
       "required": ["id", "action", "user", "timestamp"]
+    },
+    "BedSchedule": {
+      "title": "BedSchedule",
+      "description": "Atomic bed date allocations tracking schedule for double-booking prevention",
+      "type": "object",
+      "properties": {
+        "bedCode": {
+          "type": "string",
+          "description": "Bed identifier (e.g. N-B1L, B-ALL)",
+          "maxLength": 30
+        },
+        "room": {
+          "type": "string",
+          "description": "Room name",
+          "maxLength": 100
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Timestamp updated"
+        }
+      },
+      "required": ["bedCode", "room"]
+    },
+    "BookingCounter": {
+      "title": "BookingCounter",
+      "description": "Monotonic counter for generating collision-free booking IDs",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Counter name",
+          "maxLength": 64
+        },
+        "lastNumber": {
+          "type": "number",
+          "description": "Last allocated booking integer index"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Timestamp updated"
+        }
+      },
+      "required": ["id", "lastNumber"]
     }
   },
   "firestore": {
@@ -383,6 +426,18 @@
         "$ref": "#/entities/AuditLog"
       },
       "description": "Collection of traceable audit trail logs"
+    },
+    "/bed_schedules/{bedCode}": {
+      "schema": {
+        "$ref": "#/entities/BedSchedule"
+      },
+      "description": "Authoritative bed schedules for atomic transaction concurrency protection"
+    },
+    "/counters/{counterId}": {
+      "schema": {
+        "$ref": "#/entities/BookingCounter"
+      },
+      "description": "Monotonic counter documents for unique IDs"
     }
   }
 }

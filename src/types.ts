@@ -123,6 +123,34 @@ export interface ChangeLogEntry {
   snapshotBefore?: Reservation[];
 }
 
+export interface PaymentTransaction {
+  id: string;
+  reservationId: string;
+  guestId?: string;
+  amount: number;
+  currency: 'USD' | 'TZS' | 'EUR' | 'GBP';
+  type: 'deposit' | 'balance' | 'full' | 'refund' | 'fee';
+  method?: 'Cash' | 'Card' | 'M-Pesa' | 'Bank' | 'BookingPlatform' | string;
+  recordedBy: string;
+  notes?: string;
+  createdAt: string;
+}
+
+export interface BedScheduleAllocation {
+  reservationId: string;
+  guestName: string;
+  checkIn: string;
+  checkOut: string;
+  status: string;
+}
+
+export interface BedSchedule {
+  bedCode: string;
+  room: string;
+  allocations: Record<string, BedScheduleAllocation>; // dateKey YYYY-MM-DD -> allocation
+  updatedAt: string;
+}
+
 // Initial bookings (empty for fresh start)
 export const INITIAL_RESERVATIONS: Reservation[] = [];
 

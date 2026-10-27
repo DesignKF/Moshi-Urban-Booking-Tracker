@@ -172,3 +172,62 @@ test('reconcileReservations detects exact matches, discrepancies, and double boo
   assert.equal(report.conflictsCount, 1); // Double booking between MU-201 and MU-202
   assert.match(report.conflicts[0].description, /Double booking on bondeni Bed B-B1L/);
 });
+
+test('reconcileReservations handles missing booking IDs, negative numbers, and invalid date ranges gracefully', () => {
+  const headerRow = [
+    'Booking ID', 'Guest Name', 'Phone Number', 'Email', 'Guest ID',
+    'Platform', 'Check-in', 'Check-out', 'Room Selection', 'Bed Selection',
+    'Status', 'Currency', 'Gross value', 'Balance due', 'Deposit received',
+    'Other received', 'Refunds paid', 'Hold expires', 'Notes', 'Nights',
+    'Guests', 'Commission %', 'Other platform fee', 'Commission total',
+    'Net revenue', 'Net received', 'Assigned beds', 'Booking check',
+    'Assignment check', 'Blocks inventory', 'Calendar event ID', 'Calendar sync',
+    'Last synced', 'Revenue eligible', 'Arrival order', 'Departure order',
+    'Lead Guest ID', 'Lead prior stays', 'Lead loyalty', 'Add to Calendar',
+    'Pricing mode', 'Manual gross total', 'Guest records', 'Pricing check',
+    'Guest quote / TZS', 'Guest quote / USD', 'Nightly rate override / TZS',
+    'Pricing date override', 'Saved TZS per USD', 'Contact check', 'Discount %',
+    'Guest record check'
+  ];
+
+  // Row with missing booking ID (blank cell):
+  const rowBlankId = new Array(headerRow.length).fill('');
+  rowBlankId[1] = 'Elena Gilbert'; // Guest Name
+  rowBlankId[6] = '15 Dec 2026'; // Check-in
+  rowBlankId[7] = '18 Dec 2026'; // Check-out
+  rowBlankId[8] = 'Soweto (Room 4)';
+  rowBlankId[9] = 'S-S1';
+  rowBlankId[10] = 'Confirmed';
+  rowBlankId[11] = 'USD';
+  rowBlankId[12] = '60.00';
+  rowBlankId[13] = '0.00';
+  rowBlankId[14] = '60.00';
+
+  // Row with invalid inverted date range (checkIn >= checkOut):
+  const rowInvalidDates = new Array(headerRow.length).fill('');
+  rowInvalidDates[0] = 'MU-999';
+  rowInvalidDates[1] = 'Stefan Salvatore';
+  rowInvalidDates[6] = '20 Dec 2026';
+  rowInvalidDates[7] = '19 Dec 2026'; // Inverted!
+  rowInvalidDates[8] = 'Mawenzi (Room 1)';
+  rowInvalidDates[9] = 'M-S1';
+  rowInvalidDates[10] = 'Confirmed';
+  rowInvalidDates[11] = 'USD';
+  rowInvalidDates[12] = '40.00';
+
+  const parsed = parseSheetRowsToRecords([headerRow, rowBlankId, rowInvalidDates]);
+  assert.equal(parsed.length, 2);
+
+  // Missing booking ID is safely assigned a predictable index without throwing
+  assert.match(parsed[0].bookingId, /^MU-\d+$/);
+  assert.equal(parsed[0].guestName, 'Elena Gilbert');
+  assert.equal(parsed[0].checkIn, '2026-12-15');
+  assert.equal(parsed[0].checkOut, '2026-12-18');
+
+  // Reconciliation flags invalid dates
+  const report = reconcileReservations(parsed, []);
+  assert.equal(report.invalidRecordsCount, 1);
+  assert.equal(report.invalidRecords[0].bookingId, 'MU-999');
+  assert.match(report.invalidRecords[0].reason, /Invalid date range/);
+});
+

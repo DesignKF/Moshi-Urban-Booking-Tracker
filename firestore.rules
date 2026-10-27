@@ -48,11 +48,21 @@ service cloud.firestore {
         ];
     }
 
+    // Checks if user is an approved employee/admin account in user_roles collection
+    function isApprovedUser() {
+      return isSignedIn()
+        && request.auth.token.email != null
+        && !isSuspended()
+        && (
+          (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
+            && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.get('status', 'active') == 'active')
+          || (!exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email)) && isBootstrapAdmin())
+        );
+    }
+
     // System Administrator: authoritative user_roles takes precedence, fallback to bootstrap list
     function isAdmin() {
-      return isSignedIn()
-        && !isSuspended()
-        && request.auth.token.email != null
+      return isApprovedUser()
         && (
           (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
             && get(/databases/$(database)/documents/user_roles/$(request.auth.token.email)).data.role == 'admin')
@@ -63,9 +73,7 @@ service cloud.firestore {
 
     // Property Manager: permitted to manage bookings, guests, and payments
     function isPropertyManager() {
-      return isSignedIn()
-        && !isSuspended()
-        && request.auth.token.email != null
+      return isApprovedUser()
         && (
           isAdmin()
           || (exists(/databases/$(database)/documents/user_roles/$(request.auth.token.email))
@@ -75,9 +83,9 @@ service cloud.firestore {
         );
     }
 
-    // Staff member: verified authenticated user who is not suspended
+    // Staff member: verified active staff member in user_roles
     function isStaff() {
-      return isSignedIn() && !isSuspended();
+      return isApprovedUser();
     }
 
     // Entity Validation: Reservation
@@ -150,12 +158,13 @@ service cloud.firestore {
     }
 
     // Entity Validation: UserProfile (prevents self-escalation)
+    // Entity Validation: UserProfile (prevents self-escalation)
     function isValidUserProfile(data) {
       return data.keys().hasAll(['uid', 'email'])
         && data.uid is string && data.uid.size() > 0 && data.uid.size() <= 128
         && data.email is string && data.email.size() > 0 && data.email.size() <= 200
         && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 150))
-        && (!('role' in data) || (data.role == 'staff' || isAdmin()))
+        && (!('role' in data) || (data.role == 'viewer' || isAdmin()))
         && (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 50));
     }
 
@@ -172,15 +181,15 @@ service cloud.firestore {
     }
 
     // 1. Reservations Collection
-    // Read: Authenticated staff and managers only (NO public reads!)
-    // Create & Update: Property Managers and Admins only, with full schema validation
+    // Read: Authenticated approved staff and managers only (NO public reads!)
+    // Create & Update: Approved staff, managers, and admins with full schema validation
     // Delete: Admins only
     match /reservations/{reservationId} {
       allow get, list: if isStaff();
-      allow create: if isPropertyManager()
+      allow create: if isStaff()
         && isValidId(reservationId)
         && isValidReservation(incoming());
-      allow update: if isPropertyManager()
+      allow update: if isStaff()
         && isValidId(reservationId)
         && isValidReservation(incoming())
         && incoming().id == existing().id;
@@ -188,15 +197,15 @@ service cloud.firestore {
     }
 
     // 2. Guests Collection
-    // Read: Authenticated staff
-    // Create & Update: Property Managers and Admins
+    // Read: Authenticated approved staff
+    // Create & Update: Approved staff, managers, and admins
     // Delete: Admins only
     match /guests/{guestId} {
       allow get, list: if isStaff();
-      allow create: if isPropertyManager()
+      allow create: if isStaff()
         && isValidId(guestId)
         && isValidGuest(incoming());
-      allow update: if isPropertyManager()
+      allow update: if isStaff()
         && isValidId(guestId)
         && isValidGuest(incoming())
         && incoming().id == existing().id;
@@ -204,13 +213,13 @@ service cloud.firestore {
     }
 
     // 3. Payments Collection
-    // Read: Authenticated staff
-    // Create: Property Managers and Admins
+    // Read: Authenticated approved staff
+    // Create: Approved staff, managers, and admins (idempotent payment records)
     // Update: Admins only (financial adjustments)
     // Delete: Admins only
     match /payments/{paymentId} {
       allow get, list: if isStaff();
-      allow create: if isPropertyManager()
+      allow create: if isStaff()
         && isValidId(paymentId)
         && isValidPayment(incoming());
       allow update: if isAdmin()
@@ -221,10 +230,11 @@ service cloud.firestore {
     }
 
     // 4. User Roles Collection: RBAC Access Control
-    // Read: Authenticated staff
+    // Read: Own role by signed-in user, list by approved staff only
     // Manage: Administrator only
     match /user_roles/{email} {
-      allow get, list: if isSignedIn();
+      allow get: if isSignedIn() && (request.auth.token.email == email || isApprovedUser());
+      allow list: if isApprovedUser();
       allow create, update: if isAdmin() && isValidUserRole(incoming());
       allow delete: if isAdmin();
     }
@@ -245,6 +255,20 @@ service cloud.firestore {
       allow get, list: if isStaff();
       allow create: if isStaff() && isValidId(logId) && isValidAuditLog(incoming());
       allow update, delete: if isAdmin();
+    }
+
+    // 7. Bed Schedules Collection (atomic concurrency protection)
+    match /bed_schedules/{bedCode} {
+      allow get, list: if isStaff();
+      allow create, update: if isStaff() && isValidId(bedCode);
+      allow delete: if isAdmin() && isValidId(bedCode);
+    }
+
+    // 8. Counters Collection (unique ID generation)
+    match /counters/{counterId} {
+      allow get: if isStaff();
+      allow create, update: if isStaff() && isValidId(counterId);
+      allow delete: if isAdmin() && isValidId(counterId);
     }
   }
 }
