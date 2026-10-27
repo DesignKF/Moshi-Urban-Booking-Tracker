@@ -114,6 +114,24 @@ export function audit(sheet,firestore){
     return {map,duplicates:[...new Set(duplicates)].sort(),missingId};
   };
   const a=index(sheet),b=index(firestore),onlySheet=[],onlyFirestore=[],different=[];
+  const validate=(records)=>{
+    const problems=[];
+    for(let i=0;i<records.length;i++){
+      const r=records[i],fields=[];
+      for(const key of ['checkIn','checkOut']){
+        const raw=String(r[key]??'').trim();
+        if(raw && !/^\\d{4}-\\d{2}-\\d{2}$/.test(normalizeDate(raw)))fields.push(key+' (unrecognized date)');
+      }
+      const start=normalizeDate(r.checkIn),end=normalizeDate(r.checkOut);
+      if(/^\\d{4}-\\d{2}-\\d{2}$/.test(start)&&/^\\d{4}-\\d{2}-\\d{2}$/.test(end)&&end<=start)fields.push('date range');
+      for(const key of ['totalAmount','paidAmount','balanceDue']){
+        const raw=String(r[key]??'').trim();
+        if(raw && money(raw)===null)fields.push(key+' (invalid amount)');
+      }
+      if(fields.length)problems.push({row:i+1,id:String(r.id??'').trim(),fields});
+    }
+    return problems;
+  };
   for(const [id,s] of a.map){
     if(!b.map.has(id)){onlySheet.push(id);continue;}
     const f=b.map.get(id);
@@ -127,6 +145,7 @@ export function audit(sheet,firestore){
     firestore:{rows:firestore.length,uniqueIds:b.map.size,missingIds:b.missingId,duplicateIds:b.duplicates},
     onlyInSheet:onlySheet.sort(order),onlyInFirestore:onlyFirestore.sort(order),
     mismatches:different.sort((x,y)=>order(x.id,y.id)),
+    validation:{sheet:validate(sheet),firestore:validate(firestore)},
     missingValues:[...a.map].filter(([id,s])=>b.map.has(id)).map(([id,s])=>{
       const f=b.map.get(id);
       return {id,fields:comparable.filter(k=>(String(s[k]??'').trim()==='') !== (String(f[k]??'').trim()===''))};
