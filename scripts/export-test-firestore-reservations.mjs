@@ -53,7 +53,7 @@ async function main(){
   catch{throw new Error('firebase-admin is required in an isolated operator environment; do not install credentials or service account files in GitHub');}
   const app=admin.initializeApp({projectId:project});
   try{
-    const db=admin.firestore(app);db.settings({databaseId:database});
+    const db=admin.firestore.getFirestore(app,database);
     const snapshot=await db.collection('reservations').get();
     const records=snapshot.docs.map(toReservation).sort((a,b)=>a.id.localeCompare(b.id));
     // Exclusive create: refuses to overwrite an existing file.
