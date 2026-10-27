@@ -16,6 +16,9 @@ export const columns = {
   status: ['status', 'state', 'bookingstatus'],
   totalAmount: ['totalamount', 'total', 'grossvalue', 'bookingtotal'],
   paidAmount: ['paidamount', 'paid', 'amountpaid'],
+  depositReceived: ['depositreceived'],
+  otherReceived: ['otherreceived'],
+  refundsPaid: ['refundspaid'],
   balanceDue: ['balancedue', 'balance', 'outstanding'],
   currency: ['currency', 'curr'],
   email: ['email', 'emailaddress', 'mail'],
@@ -40,6 +43,25 @@ export function parseCsv(text) {
   if(field!=='' || row.length){row.push(field);rows.push(row);}
   return rows;
 }
+const monthIndex = Object.fromEntries(['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].map((v,i)=>[v,i+1]));
+export function normalizeDate(raw){
+  const text=String(raw??'').trim();
+  if(!text)return '';
+  const iso=text.match(/^(\\d{4})-(\\d{1,2})-(\\d{1,2})$/);
+  const named=text.match(/^(\\d{1,2})[ /-]([A-Za-z]{3,9})[ ,/-]+(\\d{4})$/);
+  let y,m,d;
+  if(iso){[,y,m,d]=iso; y=Number(y);m=Number(m);d=Number(d);}
+  else if(named){d=Number(named[1]);m=monthIndex[named[2].slice(0,3).toLowerCase()];y=Number(named[3]);}
+  else return text;
+  if(!m||!d||y<1900||y>2200)return text;
+  const check=new Date(Date.UTC(y,m-1,d));
+  if(check.getUTCFullYear()!==y||check.getUTCMonth()+1!==m||check.getUTCDate()!==d)return text;
+  return [y,String(m).padStart(2,'0'),String(d).padStart(2,'0')].join('-');
+}
+const money=v=>{
+  const s=String(v??'').trim().replace(/,/g,'');
+  return s!==''&&Number.isFinite(Number(s))?Number(s):null;
+};
 export function csvBookings(text){
   const rows=parseCsv(text);
   const headerIndex=rows.findIndex(r=>{
@@ -50,8 +72,18 @@ export function csvBookings(text){
   const head=rows[headerIndex].map(normalizeKey);
   const find=field=>head.findIndex(h=>columns[field].includes(h));
   const ix=Object.fromEntries(Object.keys(columns).map(k=>[k,find(k)]));
-  return rows.slice(headerIndex+1).filter(r=>r.some(v=>String(v??'').trim())).map(r=>
-    Object.fromEntries(Object.keys(columns).map(k=>[k,ix[k]<0?'':String(r[ix[k]]??'').trim()])));
+  return rows.slice(headerIndex+1).filter(r=>r.some(v=>String(v??'').trim())).map(r=>{
+    const record=Object.fromEntries(Object.keys(columns).map(k=>[k,ix[k]<0?'':String(r[ix[k]]??'').trim()]));
+    record.checkIn=normalizeDate(record.checkIn);
+    record.checkOut=normalizeDate(record.checkOut);
+    // The sheet records deposits, additional payments and refunds separately.
+    // Do not silently infer paidAmount if those source columns are incomplete.
+    if(ix.paidAmount<0 && ix.depositReceived>=0 && ix.otherReceived>=0 && ix.refundsPaid>=0){
+      const values=[record.depositReceived,record.otherReceived,record.refundsPaid].map(v=>v===''?0:money(v));
+      record.paidAmount=values.some(v=>v===null)?'':String(values[0]+values[1]-values[2]);
+    }
+    return record;
+  });
 }
 export function firestoreBookings(text){
   const parsed=JSON.parse(text);
@@ -65,7 +97,11 @@ export function firestoreBookings(text){
   });
 }
 const comparable=['guestName','guestId','checkIn','checkOut','room','bedCode','status','totalAmount','paidAmount','balanceDue','currency','email','phone'];
-const norm=(value,field)=>{const s=String(value??'').trim();return ['totalAmount','paidAmount','balanceDue'].includes(field)&&s!==''&&Number.isFinite(Number(s.replace(/,/g,'')))?String(Number(s.replace(/,/g,''))):s.toLowerCase();};
+const norm=(value,field)=>{
+  const s=String(value??'').trim();
+  if(field==='checkIn'||field==='checkOut')return normalizeDate(s);
+  return ['totalAmount','paidAmount','balanceDue'].includes(field)&&money(s)!==null?String(money(s)):s.toLowerCase();
+};
 export function audit(sheet,firestore){
   const index=records=>{
     const map=new Map(),duplicates=[]; let missingId=0;
@@ -91,6 +127,10 @@ export function audit(sheet,firestore){
     firestore:{rows:firestore.length,uniqueIds:b.map.size,missingIds:b.missingId,duplicateIds:b.duplicates},
     onlyInSheet:onlySheet.sort(order),onlyInFirestore:onlyFirestore.sort(order),
     mismatches:different.sort((x,y)=>order(x.id,y.id)),
+    missingValues:[...a.map].filter(([id,s])=>b.map.has(id)).map(([id,s])=>{
+      const f=b.map.get(id);
+      return {id,fields:comparable.filter(k=>(String(s[k]??'').trim()==='') !== (String(f[k]??'').trim()===''))};
+    }).filter(x=>x.fields.length).sort((x,y)=>order(x.id,y.id)),
     // Unmatched fields are not assumed equal: missing values require manual review.
     notice:'Differences compare nonempty values only; unmatched columns, formatting, historical versions and business conflicts require manual review. No data was changed.'
   };
