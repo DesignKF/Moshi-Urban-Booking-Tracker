@@ -55,3 +55,14 @@ test('reported missing columns are not silently considered matching',()=>{
  const result=audit([{id:'MU-1',guestName:'Example',currency:'USD'}],[{id:'MU-1',guestName:'Example',currency:''}]);
  assert.deepEqual(result.missingValues,[{id:'MU-1',fields:['currency']}]);
 });
+
+test('audit flags malformed dates, reversed stays and invalid financial amounts',()=>{
+ const report=audit([
+  {id:'MU-201',checkIn:'31 Feb 2026',checkOut:'2026-03-01',totalAmount:'oops'},
+  {id:'MU-202',checkIn:'2026-10-08',checkOut:'2026-10-07',paidAmount:'USD twenty'}
+ ],[]);
+ assert.equal(report.validation.sheet.length,2);
+ assert.ok(report.validation.sheet[0].fields.includes('totalAmount (invalid amount)'));
+ assert.ok(report.validation.sheet[1].fields.includes('date range'));
+ assert.ok(report.validation.sheet[1].fields.includes('paidAmount (invalid amount)'));
+});
