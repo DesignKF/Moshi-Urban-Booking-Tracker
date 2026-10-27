@@ -36,3 +36,22 @@ test('comparison never changes input records',()=>{
  audit(a,b);
  assert.equal(JSON.stringify(a),before);
 });
+
+test('Moshi Urban Bookings row 6 fields normalize dates and net payments',()=>{
+ const csv=[
+   'MOSHI URBAN HOSTEL',
+   'Booking ID,Guest Name,Phone Number,Email,Guest ID,Platform,Check-in,Check-out,Room Selection,Bed Selection,Status,Currency,Gross value,Balance due,Deposit received,Other received,Refunds paid',
+   'MU-101,Example Guest,123,email@example.invalid,G-101,Direct,05 Oct 2026,12 Oct 2026,Njoro,N-B1L,Confirmed,USD,140,90,35,20,5'
+ ].join('\\n');
+ const rows=csvBookings(csv);
+ assert.equal(rows.length,1);
+ assert.equal(rows[0].checkIn,'2026-10-05');
+ assert.equal(rows[0].checkOut,'2026-10-12');
+ assert.equal(rows[0].totalAmount,'140');
+ assert.equal(rows[0].paidAmount,'50');
+ assert.deepEqual(audit(rows,[{...rows[0],checkIn:'2026-10-05',checkOut:'2026-10-12'}]).mismatches,[]);
+});
+test('reported missing columns are not silently considered matching',()=>{
+ const result=audit([{id:'MU-1',guestName:'Example',currency:'USD'}],[{id:'MU-1',guestName:'Example',currency:''}]);
+ assert.deepEqual(result.missingValues,[{id:'MU-1',fields:['currency']}]);
+});
