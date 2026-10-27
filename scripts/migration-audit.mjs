@@ -50,7 +50,7 @@ export function csvBookings(text){
   const head=rows[headerIndex].map(normalizeKey);
   const find=field=>head.findIndex(h=>columns[field].includes(h));
   const ix=Object.fromEntries(Object.keys(columns).map(k=>[k,find(k)]));
-  return rows.slice(headerIndex+1).filter(r=>r.some(v=>String(v??'').trim()) && (ix.id<0 || String(r[ix.id]??'').trim())).map(r=>
+  return rows.slice(headerIndex+1).filter(r=>r.some(v=>String(v??'').trim())).map(r=>
     Object.fromEntries(Object.keys(columns).map(k=>[k,ix[k]<0?'':String(r[ix[k]]??'').trim()])));
 }
 export function firestoreBookings(text){
@@ -68,7 +68,7 @@ const comparable=['guestName','guestId','checkIn','checkOut','room','bedCode','s
 const norm=(value,field)=>{const s=String(value??'').trim();return ['totalAmount','paidAmount','balanceDue'].includes(field)&&s!==''&&Number.isFinite(Number(s.replace(/,/g,'')))?String(Number(s.replace(/,/g,''))):s.toLowerCase();};
 export function audit(sheet,firestore){
   const index=records=>{
-    const map=new Map(),duplicates=[],missingId=0;
+    const map=new Map(),duplicates=[]; let missingId=0;
     for(const r of records){
       const id=String(r.id??'').trim();
       if(!id){missingId++;continue;}
