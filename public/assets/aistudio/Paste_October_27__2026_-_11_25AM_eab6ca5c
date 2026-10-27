@@ -1,0 +1,760 @@
+# MASTER IMPLEMENTATION PROMPT — MOSHI URBAN PMS
+
+## YOUR ROLE AND MISSION
+
+You are the lead senior software engineer, Firebase security specialist, database migration engineer, quality assurance engineer, and technical project manager responsible for completing the **Moshi Urban Property Management System (PMS)**.
+
+I built this progressive web application (PWA) using Google AI Studio. I am not a developer, so I need you to perform the actual technical implementation, testing, debugging, and deployment preparation rather than repeatedly explaining programming concepts to me.
+
+**Your objective is to transform the existing application into a secure, reliable, production-ready hostel property management system that uses Firebase Firestore as its sole operational database and Google Firebase Authentication for user sign-in.**
+
+Preserve the existing application's appearance, functionality, booking history, and operational workflows unless a change is necessary for correctness, security, or reliability.
+
+Work autonomously through the full development process. Do not stop after producing a plan. Make the changes, run tests, fix errors, verify the results, and continue to the next phase.
+
+However, never bypass safety checks, pretend to have permissions you do not possess, or perform destructive production operations without my explicit approval.
+
+---
+
+# 1. PROJECT INFORMATION
+
+**Application:** Moshi Urban PMS / Moshi Urban Booking Tracker
+
+**GitHub repository:**
+https://github.com/DesignKF/Moshi-Urban-Booking-Tracker
+
+**Technology:**
+- React
+- TypeScript
+- Vite
+- Progressive Web App
+- Firebase Authentication
+- Cloud Firestore
+- Google Sheets integration that must be retired
+- Existing Google AI Studio-related application configuration
+
+**Existing Firebase project ID in repository configuration:**
+`gen-lang-client-0837479015`
+
+**Existing named Firestore database ID in repository configuration:**
+`ai-studio-moshiurbanhostel-566fa31d-f9a6-45cd-a21f-d1b89541acb3`
+
+Do not assume that these identifiers conclusively describe the deployed production environment. Inspect and verify the actual runtime configuration before performing database operations.
+
+**Confirmed Google Sheets booking workbook:**
+`Moshi-Urban-Hostel-Bookings-3.0`
+
+Workbook URL:
+https://docs.google.com/spreadsheets/d/1BEKeeGb4-MVKG5FSDDI8b7xFoPQGlTwOquhM6xS-7zw/edit
+
+**Booking source structure:**
+- Tab: `Bookings`
+- Header row: 6
+- First booking row: 7
+- Workbook time zone: `Africa/Dar_es_Salaam`
+- Booking input tab contains 72 columns.
+- Dates may appear as `05 Oct 2026`.
+- Firebase reservations may contain dates in `YYYY-MM-DD` format.
+
+Verified spreadsheet headings include:
+
+Booking ID, Guest Name, Phone Number, Email, Guest ID, Platform, Check-in, Check-out, Room Selection, Bed Selection, Status, Currency, Gross value, Balance due, Deposit received, Other received, Refunds paid, Hold expires, Notes, Nights, Guests, Commission %, Other platform fee, Commission total, Net revenue, Net received, Assigned beds, Booking check, Assignment check, Blocks inventory, Calendar event ID, Calendar sync, Last synced, Revenue eligible, Arrival order, Departure order, Lead Guest ID, Lead prior stays, Lead loyalty, Add to Calendar, Pricing mode, Manual gross total, Guest records, Pricing check, Guest quote / TZS, Guest quote / USD, Nightly rate override / TZS, Pricing date override, Saved TZS per USD, Contact check, Discount %, and Guest record check.
+
+Preserve the meaning of original booking data. Not every spreadsheet column needs to become a database field, but no potentially important information may be discarded without review.
+
+---
+
+# 2. EXISTING GITHUB DEVELOPMENT WORK
+
+Previous analysis and development identified significant security and data integrity problems.
+
+Two draft pull requests already exist:
+
+**PR #2 — Booking migration preparation**
+https://github.com/DesignKF/Moshi-Urban-Booking-Tracker/pull/2
+
+Branch:
+`phase1/read-only-migration-audit-20261027`
+
+This includes:
+- Offline reconciliation tooling.
+- CSV and Firestore JSON comparison.
+- Booking ID reconciliation.
+- Date normalization.
+- Payment-field mapping.
+- Missing-value validation.
+- Invalid date and amount checks.
+- A guarded Firestore export utility intended for a separate temporary environment.
+- Unit tests and migration documentation.
+
+**PR #3 — Draft Firestore security improvements**
+https://github.com/DesignKF/Moshi-Urban-Booking-Tracker/pull/3
+
+Branch:
+`phase2/security-rules-review-20261027`
+
+This proposes:
+- Removal of public reservation reads.
+- Removal of trust in self-assigned roles.
+- Tighter profile permissions.
+- Restricted staff-role access.
+- Static security regression checks.
+
+**Important:** These are draft development changes, not completed production solutions.
+
+Inspect both pull requests. Reuse correct work, improve incomplete work, and resolve conflicts carefully.
+
+Do not blindly merge them. The proposed Firestore rules still require security emulator tests and a more complete authentication design.
+
+Create a clean integration branch from the current repository state, incorporate reviewed changes, and preserve the production branch until the new system is ready.
+
+---
+
+# 3. NON-NEGOTIABLE REQUIREMENT: NO LOST BOOKINGS
+
+The Google Sheet contains real guest reservations.
+
+The Firestore database may contain overlapping, missing, outdated, or conflicting reservations because the existing application synchronizes between Google Sheets and Firestore.
+
+The backups of Google Sheets and Firestore have already been created, but you must independently verify the existence, scope, timestamp, readability, and recovery suitability of the backups before relying on them.
+
+**Never assume that existing Firestore records are complete or identical to Google Sheets.**
+
+Before migration:
+
+1. Identify the exact active Google Sheets booking source.
+2. Identify the correct production Firebase project and named Firestore database.
+3. Verify the Cloud Storage Firestore backup.
+4. Confirm whether the backup contains the entire database.
+5. Create an isolated testing environment.
+6. Obtain reservation records from a protected backup or another authorized read-only method.
+7. Compare Google Sheets reservations against Firestore reservations.
+8. Identify duplicates, missing records, invalid fields, room conflicts, payment differences, and inconsistent booking statuses.
+9. Produce a reconciliation report.
+10. Preserve the original booking references and history.
+11. Resolve discrepancies using verified evidence, not guesses.
+
+The migration must be repeatable and safe to restart.
+
+Running it twice must not create duplicate bookings, duplicate payments, or overwritten records.
+
+Keep a source-to-destination mapping and a migration log.
+
+Do not overwrite an existing booking simply because another record has the same booking ID.
+
+Treat ambiguous duplicates as exceptions requiring investigation.
+
+Never silently modify guest names, stay dates, currencies, room assignments, deposits, refunds, or payment balances.
+
+---
+
+# 4. DATABASE ARCHITECTURE
+
+Make **Cloud Firestore the sole authoritative operational database** for Moshi Urban PMS.
+
+Google Sheets must no longer be used for:
+- Creating bookings.
+- Editing bookings.
+- Cancelling bookings.
+- Check-ins and checkouts.
+- Recording payments.
+- Calculating live availability.
+- Storing guest records.
+- Synchronizing operational state.
+
+Design appropriate Firestore collections or equivalent structures for:
+
+- Reservations.
+- Guests.
+- Rooms and beds.
+- Payments and refunds.
+- Staff accounts and permissions.
+- Audit history.
+- Property settings.
+- Migration tracking.
+
+Use stable internal document IDs rather than generating a new booking ID based on the number of existing reservations.
+
+Maintain human-readable booking references where useful.
+
+Preserve existing reservation IDs during migration wherever possible.
+
+Use appropriate indexes, validation, transaction boundaries, and real-time listeners.
+
+Do not expose confidential guest information through public Firestore reads.
+
+Avoid keeping permanent booking records in browser localStorage.
+
+Implement controlled loading, error, empty, and offline states.
+
+The PMS must not report that a booking has been saved unless the authoritative database operation has succeeded.
+
+---
+
+# 5. FIX ALL IDENTIFIED SECURITY PROBLEMS
+
+The existing repository contains serious Firestore access-control risks.
+
+These include:
+
+- Publicly readable reservation records.
+- The possibility of privilege escalation through user profile roles.
+- Hardcoded administrator or manager email exceptions.
+- Insufficient validation of reservations.
+- Weak restrictions around modifying sensitive records.
+- Authorization logic that depends too heavily on frontend checks.
+
+Fix these problems comprehensively.
+
+Requirements:
+
+1. No unauthenticated user may read private booking or guest records.
+2. Users must not be able to assign themselves elevated roles.
+3. Suspended employees must lose access.
+4. Administrator roles must not depend solely on editable profile documents.
+5. Firestore rules must enforce access restrictions even when someone bypasses the website.
+6. The system must validate important booking fields and reject invalid records.
+7. Financial changes must be traceable.
+8. Sensitive operations must have restricted permissions.
+9. Remove unnecessary public read endpoints.
+10. Do not hardcode unrestricted administrative access based only on email addresses.
+
+Implement secure initial administrator provisioning using a trusted mechanism.
+
+Prefer trusted server-controlled role assignment and a clearly documented authorization model.
+
+If using Firebase custom claims, implement appropriate token refresh and revocation behavior.
+
+If using Firestore role documents, ensure users cannot modify their own permissions and that suspension is enforced.
+
+Use the Firebase Emulator Suite to test authorization against malicious and unauthorized scenarios.
+
+Static string checks are not enough.
+
+**Never deploy untested security rules that could either expose guest information or lock legitimate staff out of the application.**
+
+---
+
+# 6. SIMPLE GOOGLE SIGN-IN
+
+I want users to sign in easily, including with their Google accounts.
+
+Implement:
+
+- Sign in with Google.
+- Email and password sign-in as an optional alternative.
+- Password reset.
+- Clear login errors.
+- Session management.
+- Logout.
+- Mobile-friendly authentication.
+- Administrator-approved staff access.
+
+A Google account alone must not provide PMS access.
+
+The administrator must be able to approve, suspend, and deactivate employee accounts.
+
+Proposed roles:
+
+**Administrator**
+- Complete system administration.
+- Employee management.
+- Financial reporting.
+- Property configuration.
+- Restricted sensitive operations.
+
+**Property Manager**
+- Manage reservations.
+- Manage rooms and guests.
+- Record and review payments.
+- View operational reports.
+
+**Receptionist / Staff**
+- Create and manage permitted reservations.
+- Check guests in and out.
+- View approved operational information.
+- Record payments only within assigned permissions.
+
+Enforce these permissions in trusted backend logic and security rules, not only by hiding buttons.
+
+Ensure approved users can log in easily from their phones, tablets, and computers.
+
+Google Sign-In should require only the authentication permissions needed by Firebase. Remove unnecessary Google Drive and Google Sheets OAuth scopes.
+
+---
+
+# 7. PREVENT DOUBLE BOOKINGS
+
+This is a critical operational requirement.
+
+Two employees must never successfully reserve the same bed or room inventory for overlapping dates.
+
+The existing frontend checks are insufficient because two devices may make changes simultaneously.
+
+Implement authoritative conflict protection using transactions or another reliable server-controlled booking operation.
+
+Protect:
+
+- Individual bed assignments.
+- Whole-room reservations.
+- Multiple-bed reservations.
+- Overlapping dates.
+- Booking modifications.
+- Cancellations.
+- Reassignments.
+- Simultaneous reservation requests.
+
+Check-in is inclusive and checkout is exclusive for occupancy calculations.
+
+Cancelled or otherwise non-inventory-blocking bookings must be handled according to explicitly defined business rules.
+
+Do not treat invalid dates as valid bookings.
+
+Test simultaneous reservation attempts and ensure only one conflicting transaction succeeds.
+
+---
+
+# 8. FINANCIAL ACCURACY
+
+Preserve all original booking financial records.
+
+The Google Sheet contains:
+- Gross booking value.
+- Booking currency.
+- Deposits received.
+- Other payments received.
+- Refunds paid.
+- Balance due.
+- Commission information.
+- Pricing overrides.
+- USD and TZS quotations.
+
+Do not assume a spreadsheet financial column is equivalent to a Firestore field without verifying its meaning.
+
+Define a consistent financial model.
+
+Recommended approach:
+
+- Each payment and refund is stored as a separate record.
+- Every transaction records its amount, currency, date, method where available, and authorized employee.
+- Financial balances are computed consistently.
+- Original migrated values and their provenance are preserved.
+- Corrections are traceable.
+- No duplicate payments are created by retries.
+
+Avoid floating-point financial rounding errors. Use an explicitly defined currency-precision strategy.
+
+Do not convert USD into TZS without an explicitly recorded exchange rate and date.
+
+Test partial payments, overpayments, cancellations, refunds, commissions, and historical balances.
+
+---
+
+# 9. PRESERVE AND IMPROVE THE EXISTING INTERFACE
+
+Do not unnecessarily redesign Moshi Urban PMS.
+
+Preserve its existing visual identity and major functionality, including:
+
+- Dashboard.
+- Booking calendar.
+- Reservations.
+- Room and bed availability.
+- Guest management.
+- Check-in and checkout.
+- Payment tracking.
+- Booking statuses.
+- Financial reporting.
+- Administration.
+- Mobile-friendly navigation.
+- Progressive Web App installation and behavior.
+
+Improve performance and reliability while keeping the interface familiar to current users.
+
+The existing `src/App.tsx` is extremely large and contains too many responsibilities.
+
+Refactor it carefully into smaller components, hooks, and services.
+
+Separate:
+- Authentication.
+- Reservations.
+- Guests.
+- Rooms and availability.
+- Payments.
+- Administration.
+- Reporting.
+- Database operations.
+- Migration tooling.
+
+Use gradual refactoring with tests. Do not replace large sections blindly or remove features simply because they are complicated.
+
+---
+
+# 10. REMOVE GOOGLE SHEETS INTEGRATION
+
+Once the replacement system has passed migration verification and operational tests, completely remove Google Sheets as an operational dependency.
+
+This includes:
+- Google Sheets API calls.
+- Spreadsheet synchronization operations.
+- Automatic polling of spreadsheets.
+- Manual synchronization controls.
+- Spreadsheet database connection settings.
+- Spreadsheet-specific OAuth permissions.
+- Spreadsheet access-token storage.
+- Unused spreadsheet mutation code.
+- Obsolete synchronization status messages.
+
+Retire old services such as `src/sheetsService.ts` and `src/sheetSafety.mjs` only after confirming that no required function still depends on them.
+
+Keep migration utilities outside the live production application.
+
+Do not remove the source backups.
+
+If exporting reports to spreadsheets is useful in the future, implement it as a separate optional reporting feature, not as a live database dependency.
+
+---
+
+# 11. PROGRESSIVE WEB APP REQUIREMENTS
+
+Keep Moshi Urban PMS usable as a PWA.
+
+Verify:
+- Mobile responsiveness.
+- Tablet responsiveness.
+- Desktop responsiveness.
+- Installation behavior.
+- Authentication after reopening the application.
+- Secure session handling.
+- Correct caching of application assets.
+- No caching of sensitive guest data where inappropriate.
+- Updates without stale application code causing database conflicts.
+- Clear behavior during poor or lost internet connections.
+
+For booking operations, never display false confirmation when the server has not successfully committed the change.
+
+If offline booking creation is not safe, explain in the interface that a connection is required.
+
+---
+
+# 12. BACKUPS AND RECOVERY
+
+Implement a documented recovery strategy.
+
+Requirements:
+
+- Scheduled Firestore backups.
+- Appropriate retention settings.
+- Protected backup access.
+- Backup status monitoring where feasible.
+- Recovery instructions.
+- A successful restoration test in a non-production environment.
+- A pre-migration recovery point.
+- A cutover rollback procedure.
+
+Do not delete the existing Google Sheets or Firestore backups.
+
+Do not permanently delete the temporary restored data until the migration results have been verified and the retention decision is approved.
+
+---
+
+# 13. TESTING AND QUALITY ASSURANCE
+
+Run the existing project checks:
+
+`npm test`
+
+`npm run lint`
+
+`npm run build`
+
+Also implement additional automated tests for:
+
+- Google Sign-In.
+- Authorized and unauthorized users.
+- User role escalation.
+- Suspended users.
+- Firestore Security Rules using an emulator.
+- Booking creation.
+- Booking modifications.
+- Booking cancellation.
+- Double-booking prevention.
+- Multiple employees acting simultaneously.
+- Check-in and checkout.
+- Payment updates.
+- Refunds.
+- Currency handling.
+- Migration idempotency.
+- Missing reservations.
+- Duplicate booking IDs.
+- Invalid dates.
+- Invalid financial data.
+- Offline and network failure behavior.
+- Backup restoration.
+- Data reconciliation.
+- Critical application workflows.
+
+Fix failures instead of ignoring tests.
+
+Do not bypass TypeScript or security checks merely to obtain a passing build.
+
+Testing must cover actual behavior, not only code-pattern matching.
+
+---
+
+# 14. IMPLEMENTATION PHASES
+
+Proceed in the following order.
+
+## PHASE A — Repository and environment audit
+
+Inspect the existing code, configuration, tests, deployment setup, and two draft pull requests.
+
+Identify the running Firebase project and named database.
+
+Verify whether the Google AI Studio application and deployed PWA are using the same configuration.
+
+Record important findings.
+
+Create an integration branch and retain a stable production baseline.
+
+## PHASE B — Protected booking reconciliation
+
+Verify backups.
+
+Read protected source copies.
+
+Prepare a compatible Firestore reservation JSON export.
+
+Normalize spreadsheet dates and financial mappings.
+
+Run the reservation comparison.
+
+Produce counts and exception reports.
+
+Preserve all booking history.
+
+Do not migrate unresolved conflicts silently.
+
+## PHASE C — Database and authorization implementation
+
+Implement a secure Firestore data model.
+
+Fix role escalation and data exposure.
+
+Implement appropriate security rules.
+
+Configure trusted administrative provisioning.
+
+Create authorized database operations.
+
+Test against the Firebase emulator.
+
+## PHASE D — Authentication and staff management
+
+Implement easy Google Sign-In.
+
+Add optional email sign-in.
+
+Implement approved staff accounts, roles and suspensions.
+
+Verify permissions across all user roles.
+
+## PHASE E — Booking and financial workflows
+
+Replace spreadsheet operations with Firestore operations.
+
+Implement transactional availability protection.
+
+Implement reservation management.
+
+Implement guest management.
+
+Implement payment and refund recording.
+
+Implement check-in and checkout.
+
+Ensure all actions report accurate save status.
+
+## PHASE F — Interface integration and cleanup
+
+Connect every major PMS screen to Firestore.
+
+Preserve existing design.
+
+Remove operational dependency on Google Sheets.
+
+Remove obsolete spreadsheet permissions and controls.
+
+Retain necessary migration tools separately.
+
+## PHASE G — Full testing and staging
+
+Deploy to a separate staging environment.
+
+Test all critical workflows.
+
+Run data consistency checks.
+
+Test staff login and permissions.
+
+Verify backup and restore operations.
+
+Fix defects.
+
+Ensure all required acceptance tests pass.
+
+## PHASE H — Controlled production migration
+
+Do not start this phase automatically.
+
+Present a clearly understandable cutover checklist and request my approval.
+
+Before switching:
+- Freeze old-system booking edits during the final reconciliation window.
+- Make another verified backup.
+- Reconcile all changes since the previous export.
+- Confirm record counts and financial totals.
+- Verify upcoming arrivals and occupied beds.
+- Confirm no unresolved high-risk conflicts.
+- Confirm staff access.
+- Confirm rollback readiness.
+
+Only after explicit approval should production changes be made.
+
+Switch the PMS to Firestore-only operation.
+
+Verify the production system immediately.
+
+Do not disable the old operational path until the new one is confirmed working.
+
+Account for bookings entered after cutover if a rollback becomes necessary.
+
+## PHASE I — Final verification and handover
+
+Verify the live system.
+
+Confirm the following:
+
+- No real booking has been lost.
+- Guest information is access-controlled.
+- Staff can log in with Google.
+- Permissions are enforced.
+- Booking creation works.
+- Double bookings are prevented.
+- Payments are correct.
+- Check-in and checkout work.
+- Calendar and availability update correctly.
+- Google Sheets is no longer needed for daily operations.
+- The PWA works on mobile and desktop.
+- Backups are enabled and restoration has been tested.
+- The deployed application version matches the verified code.
+
+Provide a simple administrator guide written for someone who is not a developer.
+
+---
+
+# 15. RULES FOR AUTONOMOUS IMPLEMENTATION
+
+I want you to do the engineering work, not merely prepare another technical proposal.
+
+You must:
+
+1. Inspect before modifying.
+2. Reuse the existing application and working code.
+3. Make actual, reviewable source-code changes.
+4. Keep changes organized in version control.
+5. Use the two existing draft pull requests as starting references.
+6. Use secure development practices.
+7. Test every important change.
+8. Fix test failures.
+9. Preserve the current working application.
+10. Continue progressing through phases without repeatedly asking basic technical questions.
+
+Use sensible technical defaults whenever the choice does not affect production safety or my business requirements.
+
+If a tool or integration is unavailable, explain precisely what access is missing and complete the remaining safe work rather than pretending the blocked work was done.
+
+Never reveal credentials, commit private keys, or place guest booking exports in the public repository.
+
+Never claim a test passed unless it ran successfully.
+
+Never claim deployment succeeded unless the deployed application was verified.
+
+Never claim migration completed unless the actual reservation reconciliation and production checks succeeded.
+
+**You must obtain explicit approval immediately before any operation that could overwrite, delete, expose, or disrupt live reservations, alter production security access, incur material unexpected charges, or switch the production application to a different database.**
+
+---
+
+# 16. ACCEPTANCE CRITERIA
+
+The project is complete only when:
+
+- All original bookings have been accounted for and reconciled.
+- Firestore is the only operational booking database.
+- Google Sheets synchronization has been retired.
+- Google Sign-In works reliably.
+- Staff roles work correctly.
+- Unauthorized users cannot access private records.
+- Employees cannot elevate their own permissions.
+- Simultaneous booking conflicts are prevented.
+- Financial data and currencies are preserved accurately.
+- Existing operational features work.
+- The PWA is usable on mobile and desktop.
+- Automated tests pass.
+- Backups and recovery procedures are verified.
+- The production deployment is successful and checked.
+- I receive clear instructions for managing staff and daily operations.
+
+---
+
+# 17. HOW TO REPORT PROGRESS TO ME
+
+I am not a software developer.
+
+At the end of each phase, give a short report using simple English:
+
+**Completed:** What you actually implemented.
+
+**Tested:** What you verified and whether it passed.
+
+**Remaining:** What still needs work.
+
+**My action required:** Only things that genuinely need my permission or account access.
+
+**Safety status:** Whether live bookings or production settings were changed.
+
+Avoid overwhelming me with unnecessary technical detail.
+
+Do not describe incomplete tasks as completed.
+
+---
+
+# FINAL INSTRUCTION
+
+Begin by inspecting the Moshi Urban PMS source code, its current deployment configuration, and the two existing draft pull requests.
+
+Then implement the full secure Firestore-only PMS upgrade in the safest sequence.
+
+You are responsible for the technical design, implementation, debugging, testing, migration tooling, staging verification, and preparing the production release.
+
+Do not stop at planning.
+
+Preserve every real booking.
+
+Keep the application recognizable and easy to use.
+
+Use Google Sign-In.
+
+Remove Google Sheets as the operational database.
+
+Secure guest information.
+
+Prevent double bookings.
+
+Make payments reliable.
+
+Deliver a production-ready Moshi Urban Property Management System.
+
+**Start implementation now, complete every step you can safely perform, and request my approval only at the protected production cutover and other genuinely sensitive action boundaries.**

@@ -14,6 +14,7 @@ import {
   deleteReservationFromFirestore,
   clearAllReservationsFromFirestore,
   subscribeToReservations,
+  subscribeToUserRoles,
   fetchReservationsFromFirestore,
   isAuthorizedAdminEmail,
   isAuthorizedPropertyManagerOrAdmin,
@@ -811,33 +812,48 @@ export default function App() {
     };
   }, []);
 
-  // Validate Firestore Connection on boot & Subscribe to real-time reservations
+  // Validate Firestore Connection on boot
   useEffect(() => {
     testFirestoreConnection().then(connected => {
       setFirestoreConnected(connected);
-      if (connected) {
-        // Try initial pull from Firestore
-        fetchReservationsFromFirestore().then(list => {
-          if (list && list.length > 0) {
-            setReservations(list);
-          }
-        }).catch(err => {
-          console.warn('Initial Firestore fetch note:', err);
-        });
-
-        // Set up real-time onSnapshot listener
-        const unsub = subscribeToReservations(
-          (liveReservations) => {
-            setReservations(liveReservations || []);
-          },
-          (err) => {
-            console.warn('Real-time reservations sync note:', err);
-          }
-        );
-        return () => unsub();
-      }
     });
   }, []);
+
+  // Subscribe to real-time reservations and user roles ONLY when user is authenticated
+  useEffect(() => {
+    if (!user) return;
+
+    fetchReservationsFromFirestore().then(list => {
+      if (list && list.length > 0) {
+        setReservations(list);
+      }
+    }).catch(err => {
+      console.warn('Initial Firestore fetch note:', err);
+    });
+
+    const unsubReservations = subscribeToReservations(
+      (liveReservations) => {
+        setReservations(liveReservations || []);
+      },
+      (err) => {
+        console.warn('Real-time reservations sync note:', err);
+      }
+    );
+
+    const unsubRoles = subscribeToUserRoles(
+      () => {
+        setUserRoleVersion(v => v + 1);
+      },
+      (err) => {
+        console.warn('Real-time user_roles sync note:', err);
+      }
+    );
+
+    return () => {
+      unsubReservations();
+      unsubRoles();
+    };
+  }, [user]);
 
   // Format money helper
   const formatMoney = (amountUSD: number) => {
@@ -1541,13 +1557,16 @@ export default function App() {
       currency: formData.currency as 'TZS' | 'USD'
     };
 
-    // Attempt server write BEFORE closing form modal to preserve unsaved inputs upon failure:
+    // Attempt authoritative Firestore write with double-booking prevention BEFORE closing form modal
     try {
-      await saveReservationToSheet(finalRecord, isNew);
-      try {
-        await saveReservationToFirestore(finalRecord);
-      } catch (fsErr) {
-        console.warn('Firestore reservation sync note:', fsErr);
+      await saveReservationToFirestore(finalRecord);
+
+      // Optional background sync to connected Google Sheet
+      const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+      if (activeSheetId) {
+        saveReservationToSheet(finalRecord, isNew).catch(err => {
+          console.warn('Optional Google Sheet sync note:', err);
+        });
       }
 
       // Close booking modal and update local state upon confirmed success
@@ -1606,13 +1625,16 @@ export default function App() {
           snapshotBefore
         );
         setReservations(prev => prev.map(r => (r.id === bookingId ? updated : r)));
-        await saveReservationToSheet(updated, false);
         try {
           await saveReservationToFirestore(updated);
-        } catch (fsErr) {
-          console.warn('Firestore check-in update note:', fsErr);
+          const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+          if (activeSheetId) {
+            saveReservationToSheet(updated, false).catch(() => {});
+          }
+          triggerToast(`Checked in ${booking.guestName}!`, 'success');
+        } catch (fsErr: any) {
+          triggerToast(`Check-in failed: ${fsErr.message}`, 'error');
         }
-        triggerToast(`Checked in ${booking.guestName}!`, 'success');
       }
     });
   };
@@ -1642,13 +1664,16 @@ export default function App() {
           snapshotBefore
         );
         setReservations(prev => prev.map(r => (r.id === bookingId ? updated : r)));
-        await saveReservationToSheet(updated, false);
         try {
           await saveReservationToFirestore(updated);
-        } catch (fsErr) {
-          console.warn('Firestore check-out update note:', fsErr);
+          const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+          if (activeSheetId) {
+            saveReservationToSheet(updated, false).catch(() => {});
+          }
+          triggerToast(`Checked out ${booking.guestName}!`, 'success');
+        } catch (fsErr: any) {
+          triggerToast(`Check-out failed: ${fsErr.message}`, 'error');
         }
-        triggerToast(`Checked out ${booking.guestName}!`, 'success');
       }
     });
   };
@@ -1677,13 +1702,16 @@ export default function App() {
       snapshotBefore
     );
     setReservations(prev => prev.map(r => (r.id === b.id ? updated : r)));
-    await saveReservationToSheet(updated, false);
     try {
       await saveReservationToFirestore(updated);
-    } catch (fsErr) {
-      console.warn('Firestore collect payment update note:', fsErr);
+      const activeSheetId = selectedSheetId || localStorage.getItem('muh_active_sheet_id');
+      if (activeSheetId) {
+        saveReservationToSheet(updated, false).catch(() => {});
+      }
+      triggerToast(`Collected balance for ${b.guestName}. Marked fully paid!`, 'success');
+    } catch (fsErr: any) {
+      triggerToast(`Payment collection failed: ${fsErr.message}`, 'error');
     }
-    triggerToast(`Collected balance for ${b.guestName}. Marked fully paid!`, 'success');
   };
 
   // Complete connected writes before reporting success or removing local records.

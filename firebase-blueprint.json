@@ -114,6 +114,116 @@
       },
       "required": ["id", "guestName", "room", "bedCode", "checkIn", "checkOut", "status"]
     },
+    "Guest": {
+      "title": "Guest",
+      "description": "Guest contact and stay history record",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Guest ID (e.g. GS-0001)",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "description": "Guest full name",
+          "maxLength": 150
+        },
+        "email": {
+          "type": "string",
+          "description": "Guest email address",
+          "maxLength": 200
+        },
+        "phone": {
+          "type": "string",
+          "description": "Phone number",
+          "maxLength": 50
+        },
+        "totalStays": {
+          "type": "number",
+          "description": "Total number of completed stays"
+        },
+        "loyalty": {
+          "type": "string",
+          "description": "Loyalty status",
+          "maxLength": 60
+        },
+        "notes": {
+          "type": "string",
+          "description": "Staff notes about guest",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp created"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Timestamp updated"
+        }
+      },
+      "required": ["id", "name"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "Individual payment or refund transaction",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique payment identifier",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "maxLength": 64
+        },
+        "reservationId": {
+          "type": "string",
+          "description": "Associated reservation ID",
+          "maxLength": 64
+        },
+        "guestId": {
+          "type": "string",
+          "description": "Guest identifier",
+          "maxLength": 64
+        },
+        "amount": {
+          "type": "number",
+          "description": "Transaction amount"
+        },
+        "currency": {
+          "type": "string",
+          "description": "Transaction currency",
+          "enum": ["USD", "TZS", "EUR", "GBP"],
+          "maxLength": 10
+        },
+        "type": {
+          "type": "string",
+          "description": "Payment type",
+          "enum": ["deposit", "balance", "full", "refund", "fee"],
+          "maxLength": 20
+        },
+        "method": {
+          "type": "string",
+          "description": "Payment method (Cash, Card, M-Pesa, Bank, BookingPlatform)",
+          "maxLength": 40
+        },
+        "recordedBy": {
+          "type": "string",
+          "description": "Email of employee recording payment",
+          "maxLength": 200
+        },
+        "notes": {
+          "type": "string",
+          "description": "Payment notes or reference code",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Payment timestamp"
+        }
+      },
+      "required": ["id", "reservationId", "amount", "currency", "type", "recordedBy"]
+    },
     "UserProfile": {
       "title": "UserProfile",
       "description": "Staff or admin user profile",
@@ -143,6 +253,10 @@
         "createdAt": {
           "type": "string",
           "description": "Created at timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Updated at timestamp"
         }
       },
       "required": ["uid", "email"]
@@ -188,6 +302,49 @@
         }
       },
       "required": ["email", "role"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Traceable system change log entry",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Audit log entry ID",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "maxLength": 64
+        },
+        "action": {
+          "type": "string",
+          "description": "Action performed",
+          "maxLength": 50
+        },
+        "targetId": {
+          "type": "string",
+          "description": "Target reservation or entity ID",
+          "maxLength": 64
+        },
+        "guestName": {
+          "type": "string",
+          "description": "Guest name if applicable",
+          "maxLength": 150
+        },
+        "user": {
+          "type": "string",
+          "description": "Staff email who performed action",
+          "maxLength": 200
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "ISO timestamp"
+        },
+        "diffSummary": {
+          "type": "string",
+          "description": "Summary of changes",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "action", "user", "timestamp"]
     }
   },
   "firestore": {
@@ -196,6 +353,18 @@
         "$ref": "#/entities/Reservation"
       },
       "description": "Collection of hostel reservation records"
+    },
+    "/guests/{guestId}": {
+      "schema": {
+        "$ref": "#/entities/Guest"
+      },
+      "description": "Collection of guest records"
+    },
+    "/payments/{paymentId}": {
+      "schema": {
+        "$ref": "#/entities/Payment"
+      },
+      "description": "Collection of financial payment and refund entries"
     },
     "/users/{userId}": {
       "schema": {
@@ -208,6 +377,12 @@
         "$ref": "#/entities/UserRole"
       },
       "description": "Collection of assigned user roles and permission states"
+    },
+    "/audit_logs/{logId}": {
+      "schema": {
+        "$ref": "#/entities/AuditLog"
+      },
+      "description": "Collection of traceable audit trail logs"
     }
   }
 }

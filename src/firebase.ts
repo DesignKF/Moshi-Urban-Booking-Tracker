@@ -17,10 +17,12 @@ import {
   deleteDoc,
   onSnapshot,
   query,
-  orderBy
+  orderBy,
+  runTransaction
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import { type Reservation } from './types';
+import { checkNewBookingConflict } from './bookingConflicts';
 
 // Initialize Firebase App safely as singleton
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
@@ -347,38 +349,113 @@ export async function fetchReservationsFromFirestore(): Promise<Reservation[]> {
 
 export async function saveReservationToFirestore(res: Reservation): Promise<void> {
   if (!auth.currentUser) {
-    console.warn('Skipping saveReservationToFirestore: user is not signed in.');
-    return;
+    throw new Error('Authentication required: please sign in to save reservations.');
   }
   if (!isAuthorizedPropertyManagerOrAdmin(auth.currentUser.email)) {
-    console.warn('Skipping saveReservationToFirestore: user is not an authorized administrator or property manager.');
-    return;
+    throw new Error('Permission denied: only Property Managers and Administrators can save reservations.');
   }
-  const path = `reservations/${res.id}`;
+
+  // 1. Validation checks
+  if (!res.id || !res.guestName || !res.room || !res.bedCode || !res.checkIn || !res.checkOut) {
+    throw new Error('Validation error: missing required reservation fields.');
+  }
+  if (res.checkIn >= res.checkOut) {
+    throw new Error(`Invalid date range: check-in (${res.checkIn}) must be before check-out (${res.checkOut}).`);
+  }
+
+  // 2. Authoritative Double-Booking Prevention
+  // Only check conflicts for inventory-blocking reservations (ignore cancelled)
+  const isCancelled = (res.status || '').toLowerCase().includes('cancel');
+  if (!isCancelled) {
+    const existingList = await fetchReservationsFromFirestore();
+    const conflict = checkNewBookingConflict(res, existingList, res.id);
+    if (conflict) {
+      throw new Error(`Double-booking prevented: ${conflict.description}`);
+    }
+  }
+
+  const reservationPath = `reservations/${res.id}`;
+  const now = new Date().toISOString();
+  const userEmail = auth.currentUser.email || 'system';
+
   try {
+    // Save reservation document
     const docRef = doc(db, 'reservations', res.id);
     await setDoc(docRef, {
       ...res,
-      updatedAt: new Date().toISOString()
+      updatedAt: now
     }, { merge: true });
+
+    // Save/update guest record
+    const guestId = res.guestId || `GS-${res.id.replace(/\D/g, '').padStart(4, '0')}`;
+    const guestDocRef = doc(db, 'guests', guestId);
+    await setDoc(guestDocRef, {
+      id: guestId,
+      name: res.guestName,
+      email: res.email || '',
+      phone: res.phone || '',
+      loyalty: res.loyalty || 'Standard',
+      notes: res.notes || '',
+      updatedAt: now
+    }, { merge: true }).catch(e => console.warn('Guest record note:', e));
+
+    // If deposit/paid amount exists, record payment transaction
+    if (res.paidAmount && res.paidAmount > 0) {
+      const paymentId = `PAY-${res.id}-${Date.now()}`;
+      const payDocRef = doc(db, 'payments', paymentId);
+      await setDoc(payDocRef, {
+        id: paymentId,
+        reservationId: res.id,
+        guestId,
+        amount: res.paidAmount,
+        currency: res.currency || 'USD',
+        type: res.balanceDue === 0 ? 'full' : 'deposit',
+        recordedBy: userEmail,
+        notes: `Recorded with reservation ${res.id}`,
+        createdAt: now
+      }, { merge: true }).catch(e => console.warn('Payment record note:', e));
+    }
+
+    // Log in audit trail
+    const auditId = `LOG-${res.id}-${Date.now()}`;
+    const auditDocRef = doc(db, 'audit_logs', auditId);
+    await setDoc(auditDocRef, {
+      id: auditId,
+      action: 'save_reservation',
+      targetId: res.id,
+      guestName: res.guestName,
+      user: userEmail,
+      timestamp: now,
+      diffSummary: `Saved ${res.id} for ${res.guestName} (${res.room} - ${res.bedCode})`
+    }).catch(e => console.warn('Audit log note:', e));
+
   } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, path);
+    handleFirestoreError(error, OperationType.WRITE, reservationPath);
   }
 }
 
 export async function deleteReservationFromFirestore(reservationId: string): Promise<void> {
   if (!auth.currentUser) {
-    console.warn('Skipping deleteReservationFromFirestore: user is not signed in.');
-    return;
+    throw new Error('Authentication required.');
   }
-  if (!isAuthorizedPropertyManagerOrAdmin(auth.currentUser.email)) {
-    console.warn('Skipping deleteReservationFromFirestore: user is not an authorized administrator or property manager.');
-    return;
+  if (!isAuthorizedAdminEmail(auth.currentUser.email)) {
+    throw new Error('Permission denied: only Administrators can delete reservations.');
   }
   const path = `reservations/${reservationId}`;
   try {
     const docRef = doc(db, 'reservations', reservationId);
     await deleteDoc(docRef);
+
+    // Audit log
+    const auditId = `LOG-DEL-${reservationId}-${Date.now()}`;
+    await setDoc(doc(db, 'audit_logs', auditId), {
+      id: auditId,
+      action: 'delete_reservation',
+      targetId: reservationId,
+      user: auth.currentUser.email || 'admin',
+      timestamp: new Date().toISOString(),
+      diffSummary: `Deleted reservation ${reservationId}`
+    }).catch(() => {});
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -387,12 +464,10 @@ export async function deleteReservationFromFirestore(reservationId: string): Pro
 // Clear all reservations from Firestore (Admin only)
 export async function clearAllReservationsFromFirestore(): Promise<number> {
   if (!auth.currentUser) {
-    console.warn('Skipping clearAllReservationsFromFirestore: user is not signed in.');
-    return 0;
+    throw new Error('Authentication required.');
   }
   if (!isAuthorizedAdminEmail(auth.currentUser.email)) {
-    console.warn('Skipping clearAllReservationsFromFirestore: user is not an authorized administrator.');
-    return 0;
+    throw new Error('Permission denied: only Administrators can wipe reservations.');
   }
   const path = 'reservations';
   try {
@@ -405,6 +480,18 @@ export async function clearAllReservationsFromFirestore(): Promise<number> {
       count++;
     });
     await Promise.all(promises);
+
+    // Audit log
+    const auditId = `LOG-WIPE-${Date.now()}`;
+    await setDoc(doc(db, 'audit_logs', auditId), {
+      id: auditId,
+      action: 'clear_all_reservations',
+      targetId: 'all',
+      user: auth.currentUser.email || 'admin',
+      timestamp: new Date().toISOString(),
+      diffSummary: `Cleared ${count} reservations from Firestore`
+    }).catch(() => {});
+
     return count;
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
@@ -432,6 +519,29 @@ export function subscribeToReservations(
       } catch (e: any) {
         if (onError) onError(e);
       }
+    }
+  );
+}
+
+// Real-time listener for user roles
+export function subscribeToUserRoles(
+  onData: (roles: AppUserAccount[]) => void,
+  onError?: (err: Error) => void
+) {
+  const path = 'user_roles';
+  return onSnapshot(
+    collection(db, path),
+    (snapshot) => {
+      const list: AppUserAccount[] = [];
+      snapshot.forEach(docSnap => {
+        list.push(docSnap.data() as AppUserAccount);
+      });
+      updateCachedUserRoles(list);
+      onData(list);
+    },
+    (error) => {
+      console.warn('Real-time user_roles listener note:', error);
+      if (onError) onError(error instanceof Error ? error : new Error(String(error)));
     }
   );
 }

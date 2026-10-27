@@ -30,7 +30,7 @@ export interface Reservation {
   status: 'Confirmed' | 'Checked-in' | 'Checked-out' | 'Tentative' | 'No-show' | 'Cancelled' | 'Refunded' | string;
   notes?: string;
   platform?: string;
-  currency?: 'TZS' | 'USD';
+  currency?: 'USD' | 'TZS' | 'EUR' | 'GBP';
   loyalty?: string;
   discountPercent?: string;
 }
