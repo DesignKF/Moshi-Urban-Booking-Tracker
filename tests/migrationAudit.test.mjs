@@ -42,7 +42,7 @@ test('Moshi Urban Bookings row 6 fields normalize dates and net payments',()=>{
    'MOSHI URBAN HOSTEL',
    'Booking ID,Guest Name,Phone Number,Email,Guest ID,Platform,Check-in,Check-out,Room Selection,Bed Selection,Status,Currency,Gross value,Balance due,Deposit received,Other received,Refunds paid',
    'MU-101,Example Guest,123,email@example.invalid,G-101,Direct,05 Oct 2026,12 Oct 2026,Njoro,N-B1L,Confirmed,USD,140,90,35,20,5'
- ].join('\\n');
+ ].join('\n');
  const rows=csvBookings(csv);
  assert.equal(rows.length,1);
  assert.equal(rows[0].checkIn,'2026-10-05');
